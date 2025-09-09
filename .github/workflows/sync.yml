@@ -1,0 +1,35 @@
+name: pronote-to-family-mo
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # toutes les 6 heures (UTC)
+  workflow_dispatch:        # permet "Run workflow" manuel
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Recreate OAuth files from secrets
+        run: |
+          printf '%s' "${{ secrets.GCAL_CLIENT_SECRET }}" > credentials.json
+          printf '%s' "${{ secrets.GCAL_TOKEN_JSON }}"  > token.json
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pronotepy google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
+
+      - name: Run sync (Pronote -> Google Calendar Famille [Mo])
+        env:
+          PRONOTE_USER: ${{ secrets.PRONOTE_USER }}
+          PRONOTE_PASS: ${{ secrets.PRONOTE_PASS }}
+        run: python pronote_to_family_mo.py
