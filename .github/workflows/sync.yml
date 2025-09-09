@@ -2,24 +2,21 @@ name: pronote-to-family-mo
 
 on:
   schedule:
-    - cron: '7 5,17 * * *'      # 2x/jour (UTC)
+    - cron: '7 5,17 * * *'
   workflow_dispatch:
 
 jobs:
   sync:
     runs-on: [self-hosted, Windows]
 
-    # Utiliser Windows PowerShell partout
     defaults:
       run:
         shell: powershell
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
@@ -31,10 +28,11 @@ jobs:
           Set-Content -Path credentials.json -Value $env:GCAL_CLIENT_SECRET -NoNewline
           Set-Content -Path token.json        -Value $env:GCAL_TOKEN_JSON    -NoNewline
 
-      - name: Install dependencies
+      - name: Install dependencies (use job Python)
         run: |
+          python -m ensurepip --upgrade
           python -m pip install --upgrade pip
-          pip install pronotepy google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
+          python -m pip install pronotepy google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
 
       - name: Run sync (Pronote -> Google Calendar Famille [Mo])
         env:
