@@ -33,6 +33,10 @@ jobs:
           python -m ensurepip --upgrade
           python -m pip install --upgrade pip
           python -m pip install pronotepy google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
+      - name: Afficher l'IP publique du job
+        run: |
+        $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
+        Write-Host "IP publique du job: $ip"
 
       - name: Run sync (Pronote -> Google Calendar Famille [Mo])
         env:
