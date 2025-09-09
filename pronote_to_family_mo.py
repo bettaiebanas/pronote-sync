@@ -2,19 +2,20 @@ import os, hashlib, datetime as dt
 from dateutil.tz import gettz
 from pronotepy import Client
 from pronotepy.ent import ent77
+from pronotepy.exceptions import PronoteAPIError
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
 # ===== CONFIG =====
-PRONOTE_URL  = "https://0771342r.index-education.net/pronote/parent.html"  # sans ?identifiant=...
+PRONOTE_BASE = "https://0771342r.index-education.net/pronote"  # <- base commune
 PRONOTE_USER = os.getenv("PRONOTE_USER") or ""
 PRONOTE_PASS = os.getenv("PRONOTE_PASS") or ""
 
 GOOGLE_CAL_ID = "family15066434840617961429@group.calendar.google.com"  # agenda Famille
 TITLE_PREFIX  = "[Mo] "
-COLOR_ID      = "6"   # 6=orange (5=jaune, 11=vert, etc.)
+COLOR_ID      = "6"   # 6=orange
 LOOK_BACK_DAYS  = 14
 LOOK_AHEAD_DAYS = 540
 TZ = "Europe/Paris"
@@ -49,27 +50,40 @@ def list_existing_prefixed(svc, start_iso, end_iso):
         if not page: break
     return items
 
+def get_pronote_client():
+    """Essaie parent puis élève. Retourne None si IP/compte suspendu ou login KO."""
+    for path in ("/parent.html", "/eleve.html"):
+        url = f"{PRONOTE_BASE}{path}"
+        try:
+            c = Client(url, username=PRONOTE_USER, password=PRONOTE_PASS, ent=ent77)
+            if c.logged_in:
+                print(f"Login OK sur {path}")
+                return c
+        except PronoteAPIError as e:
+            if "suspended" in str(e).lower():
+                print("PRONOTE: adresse IP / compte suspendu — on réessaiera au prochain run.")
+                return None
+            raise
+    print("Login PRONOTE impossible (parent/eleve). Vérifie identifiants ENT.")
+    return None
+
 def main():
     tz = gettz(TZ)
     now = dt.datetime.now(tz)
     start_win = now - dt.timedelta(days=LOOK_BACK_DAYS)
     end_win   = now + dt.timedelta(days=LOOK_AHEAD_DAYS)
 
-    # 1) Connexion PRONOTE via ENT77
-    client = Client(PRONOTE_URL, username=PRONOTE_USER, password=PRONOTE_PASS, ent=ent77)
-    if not client.logged_in:
-        raise SystemExit("Connexion ENT77/PRONOTE échouée. Vérifie identifiants et URL 'parent.html'.")
+    client = get_pronote_client()
+    if not client:
+        return  # pas d'échec dur du job
 
-    # 2) Service Google Calendar
     svc = gcal_service()
 
-    # 3) Récup semaines PRONOTE
     lessons, d = [], start_win.date()
     while d <= end_win.date():
         lessons += client.lessons(date_from=d, date_to=d + dt.timedelta(days=6))
         d += dt.timedelta(days=7)
 
-    # 4) État désiré
     desired = {}
     for l in lessons:
         if getattr(l, "canceled", False):
@@ -95,12 +109,12 @@ def main():
             "end":   {"dateTime": end.isoformat(),   "timeZone": TZ},
         }
 
-    # 5) Réconciliation (crée/maj/supprime uniquement nos [Mo] dans la fenêtre)
     existing = {
         e["id"]: e
         for e in list_existing_prefixed(svc, start_win.isoformat(), end_win.isoformat())
         if "id" in e
     }
+
     created = updated = deleted = 0
     for ev_id, body in desired.items():
         if ev_id in existing:
@@ -119,6 +133,7 @@ def main():
         else:
             svc.events().insert(calendarId=GOOGLE_CAL_ID, body=body).execute()
             created += 1
+
     for ev_id in list(existing.keys()):
         if ev_id not in desired:
             svc.events().delete(calendarId=GOOGLE_CAL_ID, eventId=ev_id).execute()
