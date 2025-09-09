@@ -1,45 +1,56 @@
 name: pronote-to-family-mo
 
 on:
-  schedule:
-    - cron: '7 5,17 * * *'
   workflow_dispatch:
+  schedule:
+    # 06:05 et 16:05 UTC chaque jour (à ajuster si tu veux)
+    - cron: '5 6,16 * * *'
 
 jobs:
   sync:
     runs-on: [self-hosted, Windows]
 
+    # Par défaut toutes les étapes "run:" utilisent PowerShell
     defaults:
       run:
         shell: powershell
 
-    steps:
-      - uses: actions/checkout@v4
+    env:
+      PRONOTE_USER: ${{ secrets.PRONOTE_USER }}
+      PRONOTE_PASS: ${{ secrets.PRONOTE_PASS }}
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12 x64
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          architecture: 'x64'
 
-      - name: Recreate OAuth files from secrets (Windows)
-        env:
-          GCAL_CLIENT_SECRET: ${{ secrets.GCAL_CLIENT_SECRET }}
-          GCAL_TOKEN_JSON:    ${{ secrets.GCAL_TOKEN_JSON }}
+      - name: Jitter aléatoire 30s–5min
+        run: Start-Sleep -Seconds (Get-Random -Minimum 30 -Maximum 300)
+
+      - name: Afficher l'IP publique du job
         run: |
-          Set-Content -Path credentials.json -Value $env:GCAL_CLIENT_SECRET -NoNewline
-          Set-Content -Path token.json        -Value $env:GCAL_TOKEN_JSON    -NoNewline
+          try {
+            $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
+            Write-Host "IP publique du job: $ip"
+          } catch {
+            Write-Host "Impossible de récupérer l'IP publique: $($_.Exception.Message)"
+          }
 
-      - name: Install dependencies (use job Python)
+      - name: Recréer les fichiers OAuth depuis les secrets
+        run: |
+          Set-Content -Path credentials.json -Value '${{ secrets.GCAL_CLIENT_SECRET }}' -NoNewline
+          Set-Content -Path token.json        -Value '${{ secrets.GCAL_TOKEN_JSON }}'  -NoNewline
+
+      - name: Installer les dépendances Python
         run: |
           python -m ensurepip --upgrade
           python -m pip install --upgrade pip
           python -m pip install pronotepy google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
-      - name: Afficher l'IP publique du job
-        run: |
-        $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
-        Write-Host "IP publique du job: $ip"
 
       - name: Run sync (Pronote -> Google Calendar Famille [Mo])
-        env:
-          PRONOTE_USER: ${{ secrets.PRONOTE_USER }}
-          PRONOTE_PASS: ${{ secrets.PRONOTE_PASS }}
         run: python .\pronote_to_family_mo.py
