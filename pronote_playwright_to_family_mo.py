@@ -27,7 +27,7 @@ TOKEN_FILE       = "token.json"
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 # Timeouts (ms)
-TIMEOUT_MS  = 90_000
+TIMEOUT_MS  = 120_000
 SCREEN_DIR  = "screenshots"  # capturas auto (uploadées en artifact)
 
 # ========= Google Calendar =========
