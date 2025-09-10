@@ -147,19 +147,8 @@ def accept_cookies_any(page):
     click_first_in_frames(page, sels)
 
 def wait_for_timetable_ready(page, timeout_ms=TIMEOUT_MS):
-    page.wait_for_function(
-        r"""
-        () => {
-          const rx = /\d{1,2}[:hH]\d{2}.*\d{1,2}[:hH]\d{2}/;
-          const hasAria  = Array.from(document.querySelectorAll('[aria-label]')).some(e => rx.test(e.getAttribute('aria-label')||''));
-          const hasTitle = Array.from(document.querySelectorAll('[title]')).some(e => rx.test(e.getAttribute('title')||''));
-          const hasText  = Array.from(document.querySelectorAll('*')).some(e => rx.test((e.innerText||'').trim()) && (e.innerText||'').length < 160);
-          const hasHeader = /Semaine .* au .*/.test(document.body.innerText || '');
-          return hasAria || hasTitle || hasText || hasHeader;
-        }
-        """,
-        timeout=timeout_ms
-    )
+    # On appelle la version multi-frames et on ignore sa valeur (elle est renvoyée par goto_timetable)
+    return wait_timetable_any_frame(page, timeout_ms=timeout_ms)
 
 def click_text_anywhere(page, patterns: List[str]) -> bool:
     """
@@ -209,6 +198,33 @@ def click_text_anywhere(page, patterns: List[str]) -> bool:
             except:
                 pass
     return False
+import time
+
+def _frame_has_timetable_js():
+    # Détection très permissive : texte “Emploi du temps” + empreintes d’horaires / entête de semaine
+    return r"""
+      () => {
+        const txt = (document.body.innerText || '').replace(/\s+/g,' ');
+        const hasTitle = /Emploi du temps/i.test(txt) || /Planning|Agenda/i.test(txt);
+        const hasWeek  = /(Semaine|du\s+\d{1,2}\/\d{1,2}\/\d{4}\s+au\s+\d{1,2}\/\d{1,2}\/\d{4})/i.test(txt);
+        const hasTimes = /\d{1,2}\s*[h:]\s*\d{2}/i.test(txt); // ex: 8h05, 09:35
+        return (hasTitle && (hasTimes || hasWeek)) || (hasWeek && hasTimes);
+      }
+    """
+
+def wait_timetable_any_frame(page, timeout_ms=120_000):
+    """Retourne le frame qui contient l’EDT (ou lève un TimeoutError)."""
+    deadline = time.time() + timeout_ms/1000.0
+    js = _frame_has_timetable_js()
+    while time.time() < deadline:
+        for fr in page.frames:
+            try:
+                if fr.evaluate(js):
+                    return fr
+            except:
+                pass
+        page.wait_for_timeout(500)
+    raise TimeoutError("Timetable not found in any frame")
 
 # ========= Navigation =========
 def login_ent(page):
@@ -297,44 +313,76 @@ def open_pronote(context, page):
 def goto_timetable(pronote_page):
     pronote_page.set_default_timeout(TIMEOUT_MS)
     accept_cookies_any(pronote_page)
-
-    # Séquences de libellés possibles selon les thèmes PRONOTE
-    attempts = [
-        # libellés actuels les plus fréquents
-        ["Emploi du temps", "Mon emploi du temps", "Emplois du temps"],
-        # libellés “proches”
-        ["Planning", "Mon planning", "Agenda"],
-        # parfois dans “Vie scolaire” puis “Emploi du temps”
-        ["Vie scolaire", "Emploi du temps"],
-    ]
-
     os.makedirs(SCREEN_DIR, exist_ok=True)
 
-    for i, pats in enumerate(attempts, start=1):
-        # 1) clique tous les libellés de ce groupe, l’un après l’autre
-        for pat in pats:
-            clicked = click_text_anywhere(pronote_page, [pat])
-            if clicked:
-                accept_cookies_any(pronote_page)
-                # 2) tente une attente “courte” pour voir si l’EDT apparaît après ce clic
-                try:
-                    wait_for_timetable_ready(pronote_page, timeout_ms=30_000)
-                    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-ready-{i}-{pat}.png", full_page=True)
-                    return
-                except PWTimeout:
-                    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-not-ready-yet-{i}-{pat}.png", full_page=True)
-                    # on continue la boucle pour essayer un autre libellé du même groupe
-                    pass
-
-        # petite pause entre groupes d’essais
-        pronote_page.wait_for_timeout(700)
-
-    # Dernière chance : si l’EDT est déjà visible sans clic particulier
+    # 0) Déjà sur l’EDT ? (cas de ta session : oui)
     try:
-        wait_for_timetable_ready(pronote_page, timeout_ms=15_000)
+        fr = wait_timetable_any_frame(pronote_page, timeout_ms=10_000)
+        pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-already-here.png", full_page=True)
+        return fr
+    except TimeoutError:
+        pass  # on va tenter des clics
+
+    def click_text_anywhere(page, patterns):
+        for frame in page.frames:
+            for pat in patterns:
+                # Liens / boutons accessibles
+                for loc in [
+                    frame.get_by_role("link", name=re.compile(pat, re.I)),
+                    frame.get_by_role("button", name=re.compile(pat, re.I)),
+                ]:
+                    try:
+                        if loc.count() > 0:
+                            loc.first.click()
+                            return True
+                    except:
+                        pass
+                # Fallback JS : remonter jusqu’à un parent cliquable
+                try:
+                    ok = frame.evaluate(r"""
+                      (pat) => {
+                        const rx = new RegExp(pat, 'i');
+                        const nodes = Array.from(document.querySelectorAll('body *')).filter(n => (n.innerText||'').match(rx));
+                        for (const n of nodes) {
+                          let p=n;
+                          while (p) {
+                            if (p.tagName==='A' || p.tagName==='BUTTON' || p.getAttribute('role')==='button' || p.onclick) { p.click(); return true; }
+                            p = p.parentElement;
+                          }
+                        }
+                        return false;
+                      }
+                    """, pat)
+                    if ok: return True
+                except:
+                    pass
+        return False
+
+    attempts = [
+        ["Emploi du temps", "Mon emploi du temps", "Emplois du temps"],
+        ["Planning", "Agenda"],
+        ["Vie scolaire", "Emploi du temps"],  # parfois caché derrière ce chemin
+    ]
+
+    # 1) Essais successifs
+    for i, pats in enumerate(attempts, 1):
+        for pat in pats:
+            if click_text_anywhere(pronote_page, [pat]):
+                accept_cookies_any(pronote_page)
+                try:
+                    fr = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
+                    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-ready-{i}-{pat}.png", full_page=True)
+                    return fr
+                except TimeoutError:
+                    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-not-ready-{i}-{pat}.png", full_page=True)
+        pronote_page.wait_for_timeout(600)
+
+    # 2) Dernier essai : si l’EDT s’est chargé entre-temps
+    try:
+        fr = wait_timetable_any_frame(pronote_page, timeout_ms=15_000)
         pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-ready-fallback.png", full_page=True)
-        return
-    except PWTimeout:
+        return fr
+    except TimeoutError:
         pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-NOT-found.png", full_page=True)
         raise RuntimeError("Impossible d’atteindre l’Emploi du temps (après multiples essais).")
 
