@@ -1,70 +1,68 @@
-name: pronote-to-family-mo
+name: pronote-to-family-mo (Playwright)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "7 4 * * 1-5"   # jours ouvrés 04:07 UTC (à ajuster)
+    - cron: '5 6,16 * * *'   # 06:05 et 16:05 UTC ≈ 08:05/18:05 Paris
 
 jobs:
   sync:
-    runs-on: self-hosted   # ton runner Windows (PC007)
+    runs-on: [self-hosted, Windows]
+
+    defaults:
+      run:
+        shell: powershell
 
     env:
-      ENT_URL: ${{ vars.ENT_URL }}
-      PRONOTE_URL: ${{ vars.PRONOTE_URL }}
       PRONOTE_USER: ${{ secrets.PRONOTE_USER }}
       PRONOTE_PASS: ${{ secrets.PRONOTE_PASS }}
-      CAL_ID: family
-      WEEKS: "5"
-      HEADFUL: "0"
-      CLEAN_ORPHANS: "0"
+      CALENDAR_ID:  family15066434840617961429@group.calendar.google.com
+      ENT_URL:      https://ent77.seine-et-marne.fr/welcome
+      PRONOTE_URL:  "https://0771342r.index-education.net/pronote/parent.html"
+      HEADFUL:      "1"                  # mets "1" pour voir le navigateur sur le runner
+      WEEKS_TO_FETCH: "6"                # ~1 mois+
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
+          architecture: 'x64'
 
-      - name: Recreate OAuth files
-        shell: powershell
-        env:
-          GCAL_CLIENT_SECRET: ${{ secrets.GCAL_CLIENT_SECRET }}
-          GCAL_TOKEN_JSON: ${{ secrets.GCAL_TOKEN_JSON }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Content -Path credentials.json -Value $env:GCAL_CLIENT_SECRET -NoNewline
-          Set-Content -Path token.json        -Value $env:GCAL_TOKEN_JSON    -NoNewline
+      - name: Jitter aléatoire (30s–5min)
+        run: Start-Sleep -Seconds (Get-Random -Minimum 30 -Maximum 300)
 
-      - name: Bootstrap pip (use Actions Python)
-        shell: powershell
-        run: |
-          & "$env:pythonLocation\python.exe" -m ensurepip --upgrade
-          & "$env:pythonLocation\python.exe" -m pip install --upgrade pip setuptools wheel
-
-      - name: Install dependencies (same interpreter)
-        shell: powershell
-        run: |
-          & "$env:pythonLocation\python.exe" -m pip install `
-            playwright `
-            google-api-python-client `
-            google-auth-httplib2 `
-            google-auth-oauthlib `
-            python-dateutil
-          & "$env:pythonLocation\python.exe" -m playwright install chromium
-
-      - name: Public IP (debug)
-        shell: powershell
+      - name: IP publique du job
         run: |
           try {
             $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
             Write-Host "IP publique du job: $ip"
-          } catch { }
+          } catch {
+            Write-Host "IP non récupérée: $($_.Exception.Message)"
+          }
 
-      - name: Run sync
-        shell: powershell
+      - name: Recréer OAuth Google (depuis secrets)
+        run: |
+          Set-Content -Path credentials.json -Value '${{ secrets.GCAL_CLIENT_SECRET }}' -NoNewline
+          Set-Content -Path token.json        -Value '${{ secrets.GCAL_TOKEN_JSON }}'  -NoNewline
+
+      - name: Bootstrap pip (toolcache Windows)
+        run: |
+          & "$env:pythonLocation\python.exe" -V
+          & "$env:pythonLocation\python.exe" -m ensurepip --upgrade
+          & "$env:pythonLocation\python.exe" -m pip --version
+          & "$env:pythonLocation\python.exe" -m pip install --upgrade pip setuptools wheel
+
+      - name: Installer dépendances Python
+        run: |
+          & "$env:pythonLocation\python.exe" -m pip install playwright google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
+
+      - name: Installer Chromium (Playwright)
+        run: |
+          & "$env:pythonLocation\python.exe" -m playwright install chromium
+
+      - name: Lancer la synchro Playwright -> Google Calendar
         run: |
           New-Item -ItemType Directory -Force -Path screenshots | Out-Null
           & "$env:pythonLocation\python.exe" .\pronote_playwright_to_family_mo.py
@@ -74,5 +72,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: screenshots
-          path: screenshots/*
-          retention-days: 5
+          path: screenshots/**
+          if-no-files-found: ignore
