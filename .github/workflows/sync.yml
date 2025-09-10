@@ -19,7 +19,7 @@ jobs:
       CALENDAR_ID:  family15066434840617961429@group.calendar.google.com
       ENT_URL:      https://ent77.seine-et-marne.fr/welcome
       PRONOTE_URL:  ""
-      HEADFUL:      "0"   # mets "1" pour voir le navigateur sur le runner
+      HEADFUL:      "1"   # mets "1" pour voir le navigateur sur le runner
 
     steps:
       - uses: actions/checkout@v4
