@@ -3,59 +3,79 @@ name: pronote-to-family-mo
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 6 * * 1-5"   # tous les jours ouvrés à 06:17
+    - cron: "7 4 * * 1-5"   # chaque jour ouvré à 04:07 UTC (ajuste si tu veux)
 
 jobs:
   sync:
-    runs-on: self-hosted   # votre runner PC007
-    timeout-minutes: 20
-
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [self-hosted]   # mets ["windows-latest"] si tu veux tester sur runner GitHub
     env:
+      ENT_URL: ${{ vars.ENT_URL }}          # ou mets une valeur littérale ici
+      PRONOTE_URL: ${{ vars.PRONOTE_URL }}  # idem
       PRONOTE_USER: ${{ secrets.PRONOTE_USER }}
       PRONOTE_PASS: ${{ secrets.PRONOTE_PASS }}
-      HEADFUL: "1"                      # mettre "0" quand tout est calé
-
+      CAL_ID: family
+      WEEKS: "4"
+      HEADFUL: "0"                          # passe "1" pour débug
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Python 3.12 (préinstallé par l’étape setup)
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Recréer les fichiers OAuth
-        shell: pwsh
+      - name: Ensure pip (Windows peculiarity)
+        shell: bash
         run: |
-          Set-Content -Path credentials.json -Value '${{ secrets.GCAL_CLIENT_SECRET }}' -NoNewline
-          Set-Content -Path token.json        -Value '${{ secrets.GCAL_TOKEN_JSON }}' -NoNewline
+          python -m ensurepip --upgrade || true
+          python -m pip install -U pip
 
-      - name: Dépendances
-        shell: pwsh
+      - name: Recreate OAuth files from secrets
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install playwright google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          printf '%s' "${{ secrets.GCAL_CLIENT_SECRET }}" > credentials.json
+          printf '%s' "${{ secrets.GCAL_TOKEN_JSON }}"  > token.json
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade \
+            playwright \
+            google-api-python-client \
+            google-auth-httplib2 \
+            google-auth-oauthlib \
+            python-dateutil
           python -m playwright install --with-deps chromium
 
-      - name: (optionnel) afficher IP publique
+      - name: Installer Chromium (Playwright)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m playwright install chromium
+
+      - name: Debug – IP publique (utile si PRONOTE bloque par IP)
         shell: pwsh
         run: |
           try {
             $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
             Write-Host "IP publique du job: $ip"
-          } catch { }
+          } catch { Write-Host "Impossible de récupérer l'IP publique: $($_.Exception.Message)" }
 
-      - name: Sync Pronote -> Google Family [Mo]
+      - name: Lancer la synchro Playwright -> Google Calendar
         shell: pwsh
         run: |
-          python .\pronote_playwright_to_family_mo.py
+          New-Item -ItemType Directory -Force -Path screenshots | Out-Null
+          & "$env:pythonLocation\python.exe" .\pronote_playwright_to_family_mo.py
 
-      - name: Captures (si HEADFUL=1)
+      - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshots
-          path: |
-            playwright-report
-            **/*.png
-          if-no-files-found: ignore
+          path: screenshots/*
+          retention-days: 5
