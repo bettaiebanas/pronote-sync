@@ -1,74 +1,61 @@
-name: pronote-to-family-mo (Playwright)
+name: pronote-to-family-mo
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '5 6,16 * * *'   # 06:05 et 16:05 UTC ≈ 08:05/18:05 Paris
+    - cron: "17 6 * * 1-5"   # tous les jours ouvrés à 06:17
 
 jobs:
   sync:
-    runs-on: [self-hosted, Windows]
-
-    defaults:
-      run:
-        shell: powershell
+    runs-on: self-hosted   # votre runner PC007
+    timeout-minutes: 20
 
     env:
       PRONOTE_USER: ${{ secrets.PRONOTE_USER }}
       PRONOTE_PASS: ${{ secrets.PRONOTE_PASS }}
-      CALENDAR_ID:  family15066434840617961429@group.calendar.google.com
-      ENT_URL:      https://ent77.seine-et-marne.fr/welcome
-      PRONOTE_URL:  "https://0771342r.index-education.net/pronote/parent.html"   
-      HEADFUL:      "1"  # mets "1" pour voir le navigateur sur le runner
+      HEADFUL: "1"                      # mettre "0" quand tout est calé
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Python 3.12 (préinstallé par l’étape setup)
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-          architecture: 'x64'
+          python-version: "3.12"
 
-      - name: Jitter aléatoire (30s–5min)
-        run: Start-Sleep -Seconds (Get-Random -Minimum 30 -Maximum 300)
+      - name: Recréer les fichiers OAuth
+        shell: pwsh
+        run: |
+          Set-Content -Path credentials.json -Value '${{ secrets.GCAL_CLIENT_SECRET }}' -NoNewline
+          Set-Content -Path token.json        -Value '${{ secrets.GCAL_TOKEN_JSON }}' -NoNewline
 
-      - name: IP publique du job
+      - name: Dépendances
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          python -m playwright install --with-deps chromium
+
+      - name: (optionnel) afficher IP publique
+        shell: pwsh
         run: |
           try {
             $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
             Write-Host "IP publique du job: $ip"
-          } catch {
-            Write-Host "IP non récupérée: $($_.Exception.Message)"
-          }
+          } catch { }
 
-      - name: Recréer OAuth Google (depuis secrets)
+      - name: Sync Pronote -> Google Family [Mo]
+        shell: pwsh
         run: |
-          Set-Content -Path credentials.json -Value '${{ secrets.GCAL_CLIENT_SECRET }}' -NoNewline
-          Set-Content -Path token.json        -Value '${{ secrets.GCAL_TOKEN_JSON }}'  -NoNewline
+          python .\pronote_playwright_to_family_mo.py
 
-      - name: Bootstrap pip (toolcache Windows)
-        run: |
-          & "$env:pythonLocation\python.exe" -V
-          & "$env:pythonLocation\python.exe" -m ensurepip --upgrade
-          & "$env:pythonLocation\python.exe" -m pip --version
-          & "$env:pythonLocation\python.exe" -m pip install --upgrade pip setuptools wheel
-
-      - name: Installer dépendances Python
-        run: |
-          & "$env:pythonLocation\python.exe" -m pip install playwright google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
-
-      - name: Installer Chromium (Playwright)
-        run: |
-          & "$env:pythonLocation\python.exe" -m playwright install chromium
-
-      - name: Lancer la synchro Playwright -> Google Calendar
-        run: |
-          & "$env:pythonLocation\python.exe" .\pronote_playwright_to_family_mo.py
-
-      - name: Upload screenshots
+      - name: Captures (si HEADFUL=1)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshots
-          path: screenshots/**
+          path: |
+            playwright-report
+            **/*.png
           if-no-files-found: ignore
