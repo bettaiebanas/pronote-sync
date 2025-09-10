@@ -3,7 +3,7 @@ name: pronote-to-family-mo (Playwright)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '5 6,16 * * *'   # 06:05 et 16:05 UTC
+    - cron: '5 6,16 * * *'   # 06:05 et 16:05 UTC (≈ 08:05 et 18:05 Paris)
 
 jobs:
   sync:
@@ -14,13 +14,12 @@ jobs:
         shell: powershell
 
     env:
-      # Recyclage de tes secrets existants
       PRONOTE_USER: ${{ secrets.PRONOTE_USER }}
       PRONOTE_PASS: ${{ secrets.PRONOTE_PASS }}
       CALENDAR_ID:  family15066434840617961429@group.calendar.google.com
       ENT_URL:      https://ent77.seine-et-marne.fr/welcome
-      PRONOTE_URL:  ""   # laisse vide si tu passes par la tuile ENT
-      # HEADFUL: "1"    # décommente pour voir le navigateur sur le runner
+      PRONOTE_URL:  ""
+      HEADFUL:      "0"   # mets "1" pour débug visuel sur le runner
 
     steps:
       - name: Checkout repo
@@ -37,25 +36,31 @@ jobs:
 
       - name: IP publique du job
         run: |
-          try {
-            $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
-            Write-Host "IP publique du job: $ip"
-          } catch {
-            Write-Host "Impossible de récupérer l'IP: $($_.Exception.Message)"
-          }
+          $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
+          Write-Host "IP publique du job: $ip"
 
-      - name: Recréer OAuth Google
+      - name: Recréer OAuth Google (depuis secrets)
         run: |
           Set-Content -Path credentials.json -Value '${{ secrets.GCAL_CLIENT_SECRET }}' -NoNewline
           Set-Content -Path token.json        -Value '${{ secrets.GCAL_TOKEN_JSON }}'  -NoNewline
 
+      # >>> TOUT passe par l'exécutable du job : $env:pythonLocation\python.exe <<<
+      - name: Bootstrap pip (toolcache Windows)
+        run: |
+          & "$env:pythonLocation\python.exe" -V
+          & "$env:pythonLocation\python.exe" -c "import sys; print('exe:', sys.executable)"
+          & "$env:pythonLocation\python.exe" -m ensurepip --upgrade
+          & "$env:pythonLocation\python.exe" -m pip --version
+          & "$env:pythonLocation\python.exe" -m pip install --upgrade pip setuptools wheel
+
       - name: Installer dépendances Python
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install playwright google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
+          & "$env:pythonLocation\python.exe" -m pip install playwright google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
 
       - name: Installer navigateur Chromium (Playwright)
-        run: python -m playwright install chromium
+        run: |
+          & "$env:pythonLocation\python.exe" -m playwright install chromium
 
       - name: Lancer la synchro Playwright -> Google Calendar
-        run: python .\pronote_playwright_to_family_mo.py
+        run: |
+          & "$env:pythonLocation\python.exe" .\pronote_playwright_to_family_mo.py
