@@ -12,7 +12,7 @@ from googleapiclient.errors import HttpError
 
 # ========= CONFIG =========
 ENT_URL      = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
-PRONOTE_URL  = os.getenv("PRONOTE_URL", "")       # laisse vide pour passer par la tuile PRONOTE
+PRONOTE_URL  = os.getenv("PRONOTE_URL", "")       # laisse vide pour passer par la tuile PRONOTE via ENT
 ENT_USER     = os.getenv("PRONOTE_USER", "")
 ENT_PASS     = os.getenv("PRONOTE_PASS", "")
 
@@ -25,6 +25,9 @@ HEADFUL      = os.getenv("HEADFUL", "0") == "1"
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+# Timeouts (ms)
+TIMEOUT_MS = 90_000
 
 SCREEN_DIR = "screenshots"  # capturas auto (uploadées en artifact par le workflow)
 
@@ -124,141 +127,140 @@ def click_first_in_frames(page, selectors: List[str]) -> bool:
             return False
     return False
 
-def text_exists_any_frame(page, pattern: str) -> bool:
-    regex = re.compile(pattern)
-    for frame in page.frames:
-        try:
-            txt = frame.content()
-            if regex.search(txt):
-                return True
-        except:
-            pass
-    return False
+def accept_cookies_any(page):
+    # clique sur les boutons "cookies" les plus courants
+    texts = [
+        "Tout accepter", "Accepter tout", "J'accepte", "Accepter", "OK", "Continuer", "J’ai compris", "J'ai compris"
+    ]
+    sels = [f'button:has-text("{t}")' for t in texts] + [f'role=button[name="{t}"]' for t in texts]
+    click_first_in_frames(page, sels)
+
+def wait_for_timetable_ready(page):
+    """
+    Attendre que l'emploi du temps soit 'prêt' :
+    - soit présence d'une case avec horaire (aria-label/title/texte)
+    - ou présence d'un conteneur semaine
+    """
+    page.wait_for_function(
+        r"""
+        () => {
+          const rx = /\d{1,2}[:hH]\d{2}.*\d{1,2}[:hH]\d{2}/;
+          if (document.querySelector('[aria-label]')?.getAttribute('aria-label')?.match(rx)) return true;
+          const hasAria = Array.from(document.querySelectorAll('[aria-label]')).some(e => rx.test(e.getAttribute('aria-label')||''));
+          const hasTitle = Array.from(document.querySelectorAll('[title]')).some(e => rx.test(e.getAttribute('title')||''));
+          const hasText  = Array.from(document.querySelectorAll('*')).some(e => rx.test((e.innerText||'').trim()) && (e.innerText||'').length < 160);
+          const hasHeader = /Semaine .* au .*/.test(document.body.innerText || '');
+          return hasAria || hasTitle || hasText || hasHeader;
+        }
+        """,
+        timeout=TIMEOUT_MS
+    )
 
 # ========= Navigation =========
 def login_ent(page):
     os.makedirs(SCREEN_DIR, exist_ok=True)
+    page.set_default_timeout(TIMEOUT_MS)
     page.goto(ENT_URL, wait_until="load")
-    page.wait_for_load_state("networkidle")
+    page.wait_for_load_state("domcontentloaded")
+    accept_cookies_any(page)
     page.screenshot(path=f"{SCREEN_DIR}/01-ent-welcome.png", full_page=True)
 
-    # 1) Cliquer "Se connecter" / "Connexion" / bouton au header si présent
+    # Bouton "Se connecter"
     click_first_in_frames(page, [
-        'a:has-text("Se connecter")',
-        'a:has-text("Connexion")',
-        'button:has-text("Se connecter")',
-        'button:has-text("Connexion")',
-        'a[href*="login"]',
-        'a[href*="auth"]'
+        'a:has-text("Se connecter")', 'a:has-text("Connexion")',
+        'button:has-text("Se connecter")', 'button:has-text("Connexion")',
+        'a[href*="login"]', 'a[href*="auth"]'
     ])
-    page.wait_for_load_state("networkidle")
+    page.wait_for_load_state("domcontentloaded")
+    accept_cookies_any(page)
     page.screenshot(path=f"{SCREEN_DIR}/02-ent-after-click-login.png", full_page=True)
 
-    # 2) Chercher un sélecteur de login sur la page OU dans un iframe (CAS / IdP)
+    # Inputs (multi-frames)
     user_candidates = [
-        'input[name="email"]',
-        'input[name="username"]',
-        '#username',
-        'input[type="text"][name*="user"]',
-        'input[type="text"]',
-        'input[type="email"]',
-        'input#email',
-        'input[name="login"]',
-        'input[name="j_username"]'
+        'input[name="email"]','input[name="username"]','#username',
+        'input[type="text"][name*="user"]','input[type="text"]','input[type="email"]',
+        'input#email','input[name="login"]','input[name="j_username"]'
     ]
     pass_candidates = [
-        'input[type="password"][name="password"]',
-        '#password',
-        'input[type="password"]',
-        'input[name="j_password"]'
+        'input[type="password"][name="password"]','#password','input[type="password"]','input[name="j_password"]'
     ]
     submit_candidates = [
-        'button[type="submit"]',
-        'input[type="submit"]',
-        'button:has-text("Se connecter")',
-        'button:has-text("Connexion")',
-        'button:has-text("Valider")'
+        'button[type="submit"]','input[type="submit"]',
+        'button:has-text("Se connecter")','button:has-text("Connexion")','button:has-text("Valider")'
     ]
 
     user_loc = first_locator_in_frames(page, user_candidates)
     pass_loc = first_locator_in_frames(page, pass_candidates)
 
-    # Certains ENT proposent des tuiles (EduConnect, etc.). Tente un bouton "Compte .../Identifiant..."
     if not user_loc or not pass_loc:
+        # boutons de choix de fournisseur (si présent)
         click_first_in_frames(page, [
-            'button:has-text("Identifiant")',
-            'a:has-text("Identifiant")',
-            'button:has-text("Compte")',
-            'a:has-text("Compte")',
-            'a:has-text("ENT")'
+            'button:has-text("Identifiant")','a:has-text("Identifiant")',
+            'button:has-text("Compte")','a:has-text("Compte")','a:has-text("ENT")'
         ])
-        page.wait_for_load_state("networkidle")
+        page.wait_for_load_state("domcontentloaded")
+        accept_cookies_any(page)
         user_loc = first_locator_in_frames(page, user_candidates)
         pass_loc = first_locator_in_frames(page, pass_candidates)
 
     if not user_loc or not pass_loc:
         page.screenshot(path=f"{SCREEN_DIR}/03-ent-no-fields.png", full_page=True)
-        raise RuntimeError("Champ identifiant ENT introuvable (multi-frames). Mets HEADFUL=1 pour voir.")
+        raise RuntimeError("Champ identifiant ENT introuvable. Mets HEADFUL=1 pour ajuster.")
 
-    try:
-        user_loc.fill(ENT_USER)
-        pass_loc.fill(ENT_PASS)
-    except Exception as e:
-        page.screenshot(path=f"{SCREEN_DIR}/04-ent-fill-error.png", full_page=True)
-        raise RuntimeError(f"Impossible de renseigner les champs ENT: {e}")
+    user_loc.fill(ENT_USER)
+    pass_loc.fill(ENT_PASS)
 
-    # Cliquer submit
     if not click_first_in_frames(page, submit_candidates):
-        # tente Enter dans le frame des inputs
-        try:
-            user_loc.press("Enter")
-        except:
-            pass
+        user_loc.press("Enter")
 
-    page.wait_for_load_state("networkidle")
+    page.wait_for_load_state("domcontentloaded")
+    accept_cookies_any(page)
     page.screenshot(path=f"{SCREEN_DIR}/05-ent-after-submit.png", full_page=True)
 
 def open_pronote(context, page):
+    page.set_default_timeout(TIMEOUT_MS)
     if PRONOTE_URL:
         page.goto(PRONOTE_URL, wait_until="load")
-        page.wait_for_load_state("networkidle")
+        page.wait_for_load_state("domcontentloaded")
+        accept_cookies_any(page)
         page.screenshot(path=f"{SCREEN_DIR}/06-pronote-direct.png", full_page=True)
         return page
 
-    # Chercher tuile / lien PRONOTE (nouvel onglet ou même onglet)
+    # Tuile PRONOTE (popup possible)
     with page.expect_popup() as p:
         clicked = click_first_in_frames(page, [
-            'a:has-text("PRONOTE")',
-            'a[title*="PRONOTE"]',
-            'a[href*="pronote"]',
-            'text=PRONOTE'
+            'a:has-text("PRONOTE")','a[title*="PRONOTE"]','a[href*="pronote"]','text=PRONOTE'
         ])
         if not clicked:
             page.screenshot(path=f"{SCREEN_DIR}/06-pronote-tile-not-found.png", full_page=True)
             raise RuntimeError("Tuile/lien PRONOTE introuvable après login ENT.")
     try:
         pronote_page = p.value
-        pronote_page.wait_for_load_state("networkidle")
+        pronote_page.wait_for_load_state("domcontentloaded")
     except PWTimeout:
         pronote_page = page
-        pronote_page.wait_for_load_state("networkidle")
+        pronote_page.wait_for_load_state("domcontentloaded")
 
+    accept_cookies_any(pronote_page)
     pronote_page.screenshot(path=f"{SCREEN_DIR}/07-pronote-home.png", full_page=True)
     return pronote_page
 
 def goto_timetable(pronote_page):
-    # Clique "Vie scolaire" si présent
+    pronote_page.set_default_timeout(TIMEOUT_MS)
+    accept_cookies_any(pronote_page)
+
+    # Clique "Vie scolaire" si présent (selon thèmes)
     click_first_in_frames(pronote_page, [
-        'text="Vie scolaire"',
-        'button:has-text("Vie scolaire")',
-        'a:has-text("Vie scolaire")'
+        'text="Vie scolaire"','button:has-text("Vie scolaire")','a:has-text("Vie scolaire")'
     ])
-    pronote_page.wait_for_load_state("networkidle")
-    pronote_page.wait_for_timeout(500)
-    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-pronote-vie-scolaire.png", full_page=True)
+    accept_cookies_any(pronote_page)
+
+    # Attendre que les cases d’emplois du temps apparaissent
+    wait_for_timetable_ready(pronote_page)
+    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-pronote-timetable-ready.png", full_page=True)
 
 def extract_week_info(pronote_page) -> Dict[str, Any]:
-    # Header semaine
+    # Header semaine (si présent)
     header_text = ""
     for sel in ['text=/Semaine .* au .*/', '.titrePeriode', '.zoneSemaines', 'header']:
         loc = first_locator_in_frames(pronote_page, [sel])
@@ -273,7 +275,7 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
     d0 = monday_of_week(header_text)
 
     # Cases: aria-label / title / texte
-    tiles = pronote_page.evaluate("""
+    tiles = pronote_page.evaluate(r"""
     () => {
       const out = [];
       const add = (el, label) => {
@@ -286,17 +288,19 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         out.push({ label, dayIndex });
       };
 
+      const rx = /\d{1,2}[:hH]\d{2}.*\d{1,2}[:hH]\d{2}/;
+
       document.querySelectorAll('[aria-label]').forEach(e => {
         const v = e.getAttribute('aria-label');
-        if (v && /\d{1,2}[:hH]\d{2}.*\d{1,2}[:hH]\d{2}/.test(v)) add(e, v);
+        if (v && rx.test(v)) add(e, v);
       });
       document.querySelectorAll('[title]').forEach(e => {
         const v = e.getAttribute('title');
-        if (v && /\d{1,2}[:hH]\d{2}.*\d{1,2}[:hH]\d{2}/.test(v)) add(e, v);
+        if (v && rx.test(v)) add(e, v);
       });
       document.querySelectorAll('*').forEach(e => {
         const t = (e.innerText || '').trim();
-        if (t && /\d{1,2}[:hH]\d{2}.*\d{1,2}[:hH]\d{2}/.test(t) && t.length < 160) add(e, t);
+        if (t && rx.test(t) && t.length < 160) add(e, t);
       });
       return out;
     }
@@ -305,14 +309,11 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
 
 def iter_next_week(pronote_page) -> bool:
     if click_first_in_frames(pronote_page, [
-        'button[title*="suivante"]',
-        'button[aria-label*="suivante"]',
-        'button:has-text("→")',
-        'a[title*="suivante"]',
-        'a:has-text("Semaine suivante")'
+        'button[title*="suivante"]','button[aria-label*="suivante"]','button:has-text("→")',
+        'a[title*="suivante"]','a:has-text("Semaine suivante")'
     ]):
-        pronote_page.wait_for_load_state("networkidle")
-        pronote_page.wait_for_timeout(500)
+        accept_cookies_any(pronote_page)
+        wait_for_timetable_ready(pronote_page)
         pronote_page.screenshot(path=f"{SCREEN_DIR}/09-pronote-next-week.png", full_page=True)
         return True
     return False
@@ -329,11 +330,10 @@ def run():
         browser = p.chromium.launch(headless=not HEADFUL, args=["--disable-dev-shm-usage"])
         context = browser.new_context(locale="fr-FR", timezone_id="Europe/Paris")
         page = context.new_page()
+        page.set_default_timeout(TIMEOUT_MS)
 
-        # ENT
+        # ENT → PRONOTE
         login_ent(page)
-
-        # PRONOTE
         pronote = open_pronote(context, page)
         goto_timetable(pronote)
 
