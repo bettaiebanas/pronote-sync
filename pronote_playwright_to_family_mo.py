@@ -11,25 +11,24 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # ========= CONFIG =========
-ENT_URL      = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
-PRONOTE_URL  = os.getenv("PRONOTE_URL", "")       # laisse vide pour passer par la tuile PRONOTE via ENT
-ENT_USER     = os.getenv("PRONOTE_USER", "")
-ENT_PASS     = os.getenv("PRONOTE_PASS", "")
+ENT_URL       = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
+PRONOTE_URL   = os.getenv("PRONOTE_URL", "")       # si vide, on clique la tuile PRONOTE depuis l’ENT
+ENT_USER      = os.getenv("PRONOTE_USER", "")
+ENT_PASS      = os.getenv("PRONOTE_PASS", "")
 
-CALENDAR_ID  = os.getenv("CALENDAR_ID", "family15066434840617961429@group.calendar.google.com")
-TITLE_PREFIX = "[Mo] "
-COLOR_ID     = "6"                                  # 6 = orange
+CALENDAR_ID   = os.getenv("CALENDAR_ID", "family15066434840617961429@group.calendar.google.com")
+TITLE_PREFIX  = "[Mo] "
+COLOR_ID      = "6"                                 # 6 = orange
 WEEKS_TO_FETCH = 2
-HEADFUL      = os.getenv("HEADFUL", "0") == "1"
+HEADFUL       = os.getenv("HEADFUL", "0") == "1"
 
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 # Timeouts (ms)
-TIMEOUT_MS = 90_000
-
-SCREEN_DIR = "screenshots"  # capturas auto (uploadées en artifact par le workflow)
+TIMEOUT_MS  = 90_000
+SCREEN_DIR  = "screenshots"  # capturas auto (uploadées en artifact)
 
 # ========= Google Calendar =========
 def get_gcal_service():
@@ -39,7 +38,7 @@ def get_gcal_service():
     if not creds or not creds.valid:
         try:
             from google.auth.transport.requests import Request
-            if creds and creds.expired and creds.refresh_token:
+            if creds and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
                 creds.refresh(Request())
             else:
                 flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
@@ -51,19 +50,31 @@ def get_gcal_service():
             f.write(creds.to_json())
     return build("calendar", "v3", credentials=creds)
 
-def stable_event_id(start: datetime, end: datetime, title: str, location: str) -> str:
+# ---- Upsert idempotent via propriété étendue privée (pas de champ 'id') ----
+def make_hash_id(start: datetime, end: datetime, title: str, location: str) -> str:
     base = f"{start.isoformat()}|{end.isoformat()}|{title}|{location}"
-    return "mo_" + hashlib.md5(base.encode("utf-8")).hexdigest()
+    return hashlib.md5(base.encode("utf-8")).hexdigest()
 
-def upsert_event(svc, cal_id: str, ev: Dict[str, Any]) -> str:
-    try:
-        svc.events().insert(calendarId=cal_id, body=ev, sendUpdates="none").execute()
+def find_event_by_hash(svc, cal_id: str, h: str):
+    resp = svc.events().list(
+        calendarId=cal_id,
+        privateExtendedProperty=f"mo_hash={h}",
+        singleEvents=True,
+        maxResults=1,
+        orderBy="startTime",
+    ).execute()
+    items = resp.get("items", [])
+    return items[0] if items else None
+
+def upsert_event_by_hash(svc, cal_id: str, h: str, body: Dict[str, Any]) -> str:
+    existing = find_event_by_hash(svc, cal_id, h)
+    if existing:
+        ev_id = existing["id"]
+        svc.events().update(calendarId=cal_id, eventId=ev_id, body=body, sendUpdates="none").execute()
+        return "updated"
+    else:
+        svc.events().insert(calendarId=cal_id, body=body, sendUpdates="none").execute()
         return "created"
-    except HttpError as e:
-        if getattr(e, "resp", None) is not None and getattr(e.resp, "status", None) == 409:
-            svc.events().update(calendarId=cal_id, eventId=ev["id"], body=ev, sendUpdates="none").execute()
-            return "updated"
-        raise
 
 # ========= Parsing =========
 HOUR_RE = re.compile(r'(?P<h>\d{1,2})[:hH](?P<m>\d{2})')
@@ -128,25 +139,20 @@ def click_first_in_frames(page, selectors: List[str]) -> bool:
     return False
 
 def accept_cookies_any(page):
-    # clique sur les boutons "cookies" les plus courants
     texts = [
-        "Tout accepter", "Accepter tout", "J'accepte", "Accepter", "OK", "Continuer", "J’ai compris", "J'ai compris"
+        "Tout accepter","Accepter tout","J'accepte","Accepter",
+        "OK","Continuer","J’ai compris","J'ai compris"
     ]
     sels = [f'button:has-text("{t}")' for t in texts] + [f'role=button[name="{t}"]' for t in texts]
     click_first_in_frames(page, sels)
 
 def wait_for_timetable_ready(page):
-    """
-    Attendre que l'emploi du temps soit 'prêt' :
-    - soit présence d'une case avec horaire (aria-label/title/texte)
-    - ou présence d'un conteneur semaine
-    """
     page.wait_for_function(
         r"""
         () => {
           const rx = /\d{1,2}[:hH]\d{2}.*\d{1,2}[:hH]\d{2}/;
           if (document.querySelector('[aria-label]')?.getAttribute('aria-label')?.match(rx)) return true;
-          const hasAria = Array.from(document.querySelectorAll('[aria-label]')).some(e => rx.test(e.getAttribute('aria-label')||''));
+          const hasAria  = Array.from(document.querySelectorAll('[aria-label]')).some(e => rx.test(e.getAttribute('aria-label')||''));
           const hasTitle = Array.from(document.querySelectorAll('[title]')).some(e => rx.test(e.getAttribute('title')||''));
           const hasText  = Array.from(document.querySelectorAll('*')).some(e => rx.test((e.innerText||'').trim()) && (e.innerText||'').length < 160);
           const hasHeader = /Semaine .* au .*/.test(document.body.innerText || '');
@@ -165,17 +171,15 @@ def login_ent(page):
     accept_cookies_any(page)
     page.screenshot(path=f"{SCREEN_DIR}/01-ent-welcome.png", full_page=True)
 
-    # Bouton "Se connecter"
     click_first_in_frames(page, [
-        'a:has-text("Se connecter")', 'a:has-text("Connexion")',
-        'button:has-text("Se connecter")', 'button:has-text("Connexion")',
-        'a[href*="login"]', 'a[href*="auth"]'
+        'a:has-text("Se connecter")','a:has-text("Connexion")',
+        'button:has-text("Se connecter")','button:has-text("Connexion")',
+        'a[href*="login"]','a[href*="auth"]'
     ])
     page.wait_for_load_state("domcontentloaded")
     accept_cookies_any(page)
     page.screenshot(path=f"{SCREEN_DIR}/02-ent-after-click-login.png", full_page=True)
 
-    # Inputs (multi-frames)
     user_candidates = [
         'input[name="email"]','input[name="username"]','#username',
         'input[type="text"][name*="user"]','input[type="text"]','input[type="email"]',
@@ -191,9 +195,7 @@ def login_ent(page):
 
     user_loc = first_locator_in_frames(page, user_candidates)
     pass_loc = first_locator_in_frames(page, pass_candidates)
-
     if not user_loc or not pass_loc:
-        # boutons de choix de fournisseur (si présent)
         click_first_in_frames(page, [
             'button:has-text("Identifiant")','a:has-text("Identifiant")',
             'button:has-text("Compte")','a:has-text("Compte")','a:has-text("ENT")'
@@ -226,7 +228,6 @@ def open_pronote(context, page):
         page.screenshot(path=f"{SCREEN_DIR}/06-pronote-direct.png", full_page=True)
         return page
 
-    # Tuile PRONOTE (popup possible)
     with page.expect_popup() as p:
         clicked = click_first_in_frames(page, [
             'a:has-text("PRONOTE")','a[title*="PRONOTE"]','a[href*="pronote"]','text=PRONOTE'
@@ -248,19 +249,14 @@ def open_pronote(context, page):
 def goto_timetable(pronote_page):
     pronote_page.set_default_timeout(TIMEOUT_MS)
     accept_cookies_any(pronote_page)
-
-    # Clique "Vie scolaire" si présent (selon thèmes)
     click_first_in_frames(pronote_page, [
         'text="Vie scolaire"','button:has-text("Vie scolaire")','a:has-text("Vie scolaire")'
     ])
     accept_cookies_any(pronote_page)
-
-    # Attendre que les cases d’emplois du temps apparaissent
     wait_for_timetable_ready(pronote_page)
     pronote_page.screenshot(path=f"{SCREEN_DIR}/08-pronote-timetable-ready.png", full_page=True)
 
 def extract_week_info(pronote_page) -> Dict[str, Any]:
-    # Header semaine (si présent)
     header_text = ""
     for sel in ['text=/Semaine .* au .*/', '.titrePeriode', '.zoneSemaines', 'header']:
         loc = first_locator_in_frames(pronote_page, [sel])
@@ -274,7 +270,6 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
 
     d0 = monday_of_week(header_text)
 
-    # Cases: aria-label / title / texte
     tiles = pronote_page.evaluate(r"""
     () => {
       const out = [];
@@ -287,16 +282,12 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         }
         out.push({ label, dayIndex });
       };
-
       const rx = /\d{1,2}[:hH]\d{2}.*\d{1,2}[:hH]\d{2}/;
-
       document.querySelectorAll('[aria-label]').forEach(e => {
-        const v = e.getAttribute('aria-label');
-        if (v && rx.test(v)) add(e, v);
+        const v = e.getAttribute('aria-label'); if (v && rx.test(v)) add(e, v);
       });
       document.querySelectorAll('[title]').forEach(e => {
-        const v = e.getAttribute('title');
-        if (v && rx.test(v)) add(e, v);
+        const v = e.getAttribute('title'); if (v && rx.test(v)) add(e, v);
       });
       document.querySelectorAll('*').forEach(e => {
         const t = (e.innerText || '').trim();
@@ -362,16 +353,24 @@ def run():
                 title = (parsed["summary"] or "Cours").strip()
                 title = f"{TITLE_PREFIX}{title}"
 
-                ev = {
-                    "id": stable_event_id(start_dt, end_dt, title, parsed["room"]),
+                hash_id = make_hash_id(start_dt, end_dt, title, parsed["room"])
+                event = {
+                    # on NE met PAS "id" → Google génère
                     "summary": title,
                     "location": parsed["room"],
                     "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Paris"},
                     "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "Europe/Paris"},
                     "colorId": COLOR_ID,
+                    "extendedProperties": {
+                        "private": {
+                            "mo_hash": hash_id,
+                            "source":  "pronote_playwright",
+                        }
+                    },
                 }
+
                 try:
-                    action = upsert_event(svc, CALENDAR_ID, ev)
+                    action = upsert_event_by_hash(svc, CALENDAR_ID, hash_id, event)
                     if action == "created": created += 1
                     else: updated += 1
                 except HttpError as e:
