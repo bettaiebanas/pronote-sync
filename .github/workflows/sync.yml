@@ -1,23 +1,26 @@
-name: pronote-to-family-mo
+name: pronote-to-family-mo (Playwright)
 
 on:
   workflow_dispatch:
   schedule:
-    # 06:05 et 16:05 UTC chaque jour (à ajuster si tu veux)
-    - cron: '5 6,16 * * *'
+    - cron: '5 6,16 * * *'   # 06:05 et 16:05 UTC
 
 jobs:
   sync:
     runs-on: [self-hosted, Windows]
 
-    # Par défaut toutes les étapes "run:" utilisent PowerShell
     defaults:
       run:
         shell: powershell
 
     env:
+      # Recyclage de tes secrets existants
       PRONOTE_USER: ${{ secrets.PRONOTE_USER }}
       PRONOTE_PASS: ${{ secrets.PRONOTE_PASS }}
+      CALENDAR_ID:  family15066434840617961429@group.calendar.google.com
+      ENT_URL:      https://ent77.seine-et-marne.fr/welcome
+      PRONOTE_URL:  ""   # laisse vide si tu passes par la tuile ENT
+      # HEADFUL: "1"    # décommente pour voir le navigateur sur le runner
 
     steps:
       - name: Checkout repo
@@ -29,28 +32,30 @@ jobs:
           python-version: '3.12'
           architecture: 'x64'
 
-      - name: Jitter aléatoire 30s–5min
+      - name: Jitter aléatoire (30s–5min)
         run: Start-Sleep -Seconds (Get-Random -Minimum 30 -Maximum 300)
 
-      - name: Afficher l'IP publique du job
+      - name: IP publique du job
         run: |
           try {
             $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
             Write-Host "IP publique du job: $ip"
           } catch {
-            Write-Host "Impossible de récupérer l'IP publique: $($_.Exception.Message)"
+            Write-Host "Impossible de récupérer l'IP: $($_.Exception.Message)"
           }
 
-      - name: Recréer les fichiers OAuth depuis les secrets
+      - name: Recréer OAuth Google
         run: |
           Set-Content -Path credentials.json -Value '${{ secrets.GCAL_CLIENT_SECRET }}' -NoNewline
           Set-Content -Path token.json        -Value '${{ secrets.GCAL_TOKEN_JSON }}'  -NoNewline
 
-      - name: Installer les dépendances Python
+      - name: Installer dépendances Python
         run: |
-          python -m ensurepip --upgrade
           python -m pip install --upgrade pip
-          python -m pip install pronotepy google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
+          python -m pip install playwright google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
 
-      - name: Run sync (Pronote -> Google Calendar Famille [Mo])
-        run: python .\pronote_to_family_mo.py
+      - name: Installer navigateur Chromium (Playwright)
+        run: python -m playwright install chromium
+
+      - name: Lancer la synchro Playwright -> Google Calendar
+        run: python .\pronote_playwright_to_family_mo.py
