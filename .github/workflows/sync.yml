@@ -21,6 +21,9 @@ jobs:
       PRONOTE_URL:  "https://0771342r.index-education.net/pronote/parent.html"
       HEADFUL:      "1"                  # mets "1" pour voir le navigateur sur le runner
       WEEKS_TO_FETCH: "6"                # ~1 mois+
+      TIMETABLE_PRE_SELECTOR: '#GInterface\.Instances\[0\]\.Instances\[1\]_Combo5'
+      TIMETABLE_SELECTOR:     '#GInterface\.Instances\[0\]\.Instances\[1\]_Liste_niveau5 > ul > li:nth-child(1) > div > div'
+      TIMETABLE_FRAME:        'parent.html'   # optionnel; mets '' si inutile
 
     steps:
       - uses: actions/checkout@v4
