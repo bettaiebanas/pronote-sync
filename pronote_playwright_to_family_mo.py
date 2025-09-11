@@ -48,6 +48,114 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 TIMEOUT_MS  = 120_000
 SCREEN_DIR  = "screenshots"
 
+MONTHS_FR = {
+    "janvier":1, "février":2, "fevrier":2, "mars":3, "avril":4, "mai":5, "juin":6,
+    "juillet":7, "août":8, "aout":8, "septembre":9, "octobre":10, "novembre":11, "décembre":12, "decembre":12
+}
+
+def parse_aria_label_course(label: str, anchor_year: int) -> Optional[Dict[str, datetime]]:
+    """
+    Ex: 'Cours du 8 septembre 2025 de 9 heures 05 à 10 heures 00'
+        'Cours du 8 septembre de 9 heures 05 à 10 heures 00'
+    Returns {'start': dt, 'end': dt} or None
+    """
+    if not label: 
+        return None
+    s = " ".join(label.split()).lower()
+
+    # date 'du 8 septembre [yyyy]'
+    mdate = re.search(r"du\s+(\d{1,2})\s+([a-zéèêûôîïàù]+)(?:\s+(\d{4}))?", s)
+    if not mdate:
+        return None
+    day = int(mdate.group(1))
+    month_name = mdate.group(2).replace("é","e").replace("è","e").replace("ê","e").replace("û","u").replace("ï","i").replace("î","i").replace("à","a").replace("ù","u").replace("ô","o").replace("â","a")
+    month = MONTHS_FR.get(month_name, None)
+    if not month:
+        return None
+    year = int(mdate.group(3)) if mdate.group(3) else anchor_year
+
+    # times 'de 9 heures 05 à 10 heures 00'  / also accept '9h05'
+    mtimes = re.search(
+        r"de\s*(\d{1,2})\s*(?:h|heures?)\s*(\d{2})\s*à\s*(\d{1,2})\s*(?:h|heures?)\s*(\d{2})",
+        s
+    )
+    if not mtimes:
+        return None
+
+    h1,m1,h2,m2 = map(int, mtimes.groups())
+    try:
+        d = datetime(year, month, day)
+        start = d.replace(hour=h1, minute=m1, second=0, microsecond=0)
+        end   = d.replace(hour=h2, minute=m2, second=0, microsecond=0)
+        # guard if over midnight (unlikely here)
+        if end < start: 
+            end += timedelta(days=1)
+        return {"start": start, "end": end}
+    except Exception:
+        return None
+def extract_courses_from_aria(pronote_page, header_monday: Optional[datetime]) -> List[Dict[str, Any]]:
+    """
+    Scrape all .cours-simple[aria-label] in the timetable frame.
+    Use header_monday to infer the YEAR when the aria-label doesn't include it.
+    Returns list of {'start','end','label','room'} dicts for the *current visible week*.
+    """
+    fr = wait_timetable_any_frame(pronote_page, timeout_ms=10_000)
+
+    # Try to get header text ('du 08/09/2025 au 12/09/2025') to compute week bounds + anchor year
+    header_text = ""
+    for sel in ['text=/Semaine .* au .*/', '.titrePeriode', '.zoneSemaines', 'header']:
+        try:
+            loc = fr.locator(sel)
+            if loc.count() > 0:
+                header_text = (loc.first.inner_text() or "").strip()
+                if header_text:
+                    break
+        except:
+            pass
+
+    monday = monday_from_header(header_text) or header_monday
+    # Week bounds (Mon..Sun) to filter out spurious elements from other weeks
+    week_start = monday.date() if monday else None
+    week_end   = (monday + timedelta(days=6)).date() if monday else None
+
+    # Anchor year used when aria-label has no year
+    anchor_year = (monday.year if monday else datetime.now().year)
+
+    # Pull every .cours-simple with an aria-label
+    nodes = fr.locator('div.cours-simple[role="group"][aria-label*="Cours du"]')
+    count = nodes.count()
+    items: List[Dict[str, Any]] = []
+    for i in range(count):
+        try:
+            lab = nodes.nth(i).get_attribute("aria-label") or ""
+            times = parse_aria_label_course(lab, anchor_year)
+            if not times:
+                continue
+
+            # subject/room from visible text inside the node (optional best-effort)
+            inner = (nodes.nth(i).inner_text() or "").strip()
+            room  = ""
+            m_room = re.search(r"\b(?:salle|salles?)\s*([A-Z0-9\-_.]+)\b", inner, flags=re.I)
+            if m_room: room = m_room.group(1)
+
+            start_dt, end_dt = times["start"], times["end"]
+
+            # Filter to current week if we know it
+            if week_start and week_end:
+                if not (week_start <= start_dt.date() <= week_end):
+                    continue
+
+            items.append({
+                "label": lab,
+                "room": room,
+                "start": start_dt,
+                "end": end_dt,
+            })
+        except Exception:
+            continue
+
+    return items
+
 def log(*a):
     print(*a, flush=True)
 
@@ -536,80 +644,89 @@ def run():
             w = csv.writer(fcsv, delimiter=";")
             w.writerow(["week_idx","date","start","end","title","room"])
 
-            for week_idx in range(start_idx, end_idx + 1):
-                used = goto_week_by_index(pronote, week_idx)
-                ensure_all_visible(pronote)
-                pronote.screenshot(path=f"{SCREEN_DIR}/08-week-{week_idx}.png", full_page=True)
+for week_idx in range(start_idx, end_idx + 1):
+    # 1) Aller à l’onglet Semaine N et s’assurer que tout est visible
+    used_tab = goto_week_by_index(pronote, week_idx)
+    accept_cookies_any(pronote)
+    ensure_all_visible(pronote)
+    pronote.screenshot(path=f"{SCREEN_DIR}/08-week-{week_idx}.png", full_page=True)
 
-                data = extract_week_items_with_dates(pronote)
-                hdr  = (data.get("header") or "").replace("\n"," ")[:160]
-                nb   = sum(len(d["tiles"]) for d in data.get("days", []))
-                log(f"Semaine {week_idx}: {nb} cours, header='{hdr}'")
+    # 2) Si on n'a pas encore d'ancre (lundi de référence), on la lit dans l’entête
+    if anchor_monday is None:
+        try:
+            fr = wait_timetable_any_frame(pronote, timeout_ms=10_000)
+            hdr = ""
+            for sel in ['.titrePeriode', '.zoneSemaines', 'header', 'text=/Semaine .* au .*/']:
+                loc = fr.locator(sel)
+                if loc.count() > 0:
+                    hdr = (loc.first.inner_text() or "").strip()
+                    if hdr:
+                        break
+            base = monday_of_week(hdr)  # <- ta fonction existante
+            if base:
+                anchor_monday = base
+                anchor_week_idx = week_idx
+                dbg(f"Ancre lundi={anchor_monday.date().isoformat()} pour onglet {anchor_week_idx}")
+        except Exception:
+            pass
 
-                # Log détaillé par jour
-                for d in data.get("days", []):
-                    sample = ", ".join([t["label"][:40] for t in d["tiles"][:3]])
-                    dbg(f"  - {d['dateText']} : {len(d['tiles'])} tuiles [{sample}]")
+    # 3) Lundi estimé pour CET onglet (sert d’année si aria-label n’en a pas)
+    monday_guess = None
+    if anchor_monday is not None and anchor_week_idx is not None:
+        monday_guess = anchor_monday + timedelta(days=7 * (week_idx - anchor_week_idx))
 
-                entries: List[Dict[str, Any]] = []
-                for day in data.get("days", []):
-                    date_txt = day["dateText"]
-                    for t in day["tiles"]:
-                        label = (t.get("label") or "").strip()
-                        ts = parse_timespan(label)
-                        if not ts: 
-                            dbg(f"    skip (no timespan): {label[:80]}")
-                            continue
-                        (h1,m1),(h2,m2) = ts
-                        start_dt = to_dt_from_date_and_hm(date_txt, (h1,m1))
-                        end_dt   = to_dt_from_date_and_hm(date_txt, (h2,m2))
-                        if not start_dt or not end_dt:
-                            dbg(f"    skip (bad date): {date_txt} / {label[:80]}")
-                            continue
+    # 4) >>> NOUVEAU : on lit tous les cours via aria-label dans la frame
+    tiles = extract_courses_from_aria(pronote, header_monday=monday_guess)
+    dbg(f"Semaine {week_idx}: tiles via aria={len(tiles)}")
 
-                        now = datetime.now()
-                        if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=120)):
-                            dbg(f"    skip (out of window): {start_dt} → {end_dt} / {label[:60]}")
-                            continue
+    # 5) Construire les entrées (et filtrer hors plage / fusionner)
+    entries = []
+    now = datetime.now()
+    for t in tiles:
+        start_dt, end_dt = t["start"], t["end"]
+        if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=120)):
+            continue
 
-                        title = f"{TITLE_PREFIX}{clean_summary(label)}"
-                        room  = extract_room(label)
+        # Titre (on garde le sujet si tu l’ajoutes dans extract_courses_from_aria,
+        # sinon on retombe sur "Cours")
+        subject = t.get("subject") or "Cours"
+        title = f"{TITLE_PREFIX}{subject}"
+        room  = t.get("room", "")
 
-                        entries.append({
-                            "title": title,
-                            "room": room,
-                            "start": start_dt,
-                            "end": end_dt,
-                            "date": start_dt.date(),
-                        })
+        entries.append({
+            "title": title,
+            "room": room,
+            "start": start_dt,
+            "end": end_dt,
+            "date": start_dt.date(),
+        })
 
-                dbg(f"  entries construits: {len(entries)}")
-                for e in entries[:3]:
-                    dbg(f"    ex: {e['title']} | {e['start']}→{e['end']} | {e['room']}")
+    dbg(f"  entries construits: {len(entries)}")
+    entries = coalesce(entries)  # ta fonction de fusion des créneaux consécutifs
+    dbg(f"  après fusion: {len(entries)}")
 
-                # fusion des blocs contigus
-                entries = coalesce(entries)
-                dbg(f"  après fusion: {len(entries)}")
+    # 6) Upsert vers Google Calendar (idempotent via mo_hash)
+    for e in entries:
+        h = make_hash_id(e["start"], e["end"], e["title"], e["room"])
+        body = {
+            "summary": e["title"],
+            "location": e["room"],
+            "start": {"dateTime": e["start"].isoformat(), "timeZone": "Europe/Paris"},
+            "end":   {"dateTime": e["end"].isoformat(),   "timeZone": "Europe/Paris"},
+            "colorId": COLOR_ID,
+            "extendedProperties": {"private": {"mo_hash": h, "source": "pronote_playwright"}},
+        }
+        try:
+            action = upsert_event_by_hash(svc, CALENDAR_ID, h, body)
+            if action == "created": created += 1
+            else:                       updated += 1
+        except HttpError as ehttp:
+            log(f"[GCAL] {ehttp}")
 
-                # dump CSV + envoi GCal
-                for e in entries:
-                    w.writerow([week_idx, e["date"].isoformat(), e["start"].isoformat(), e["end"].isoformat(), e["title"], e["room"]])
-
-                    h = make_hash_id(e["start"], e["end"], e["title"], e["room"])
-                    body = {
-                        "summary": e["title"],
-                        "location": e["room"],
-                        "start": {"dateTime": e["start"].isoformat(), "timeZone": "Europe/Paris"},
-                        "end":   {"dateTime": e["end"].isoformat(),   "timeZone": "Europe/Paris"},
-                        "colorId": COLOR_ID,
-                        "extendedProperties": {"private": {"mo_hash": h, "source": "pronote_playwright"}},
-                    }
-                    try:
-                        action = upsert_event_by_hash(svc, CALENDAR_ID, h, body)
-                        if action == "created": created += 1
-                        else: updated += 1
-                    except HttpError as ehttp:
-                        log(f"[GCAL] {ehttp}")
+    # Fallback si l’onglet ne clique pas, mais qu’on a d’autres semaines à lire
+    if not used_tab and week_idx < end_idx:
+        if not iter_next_week(pronote):
+            break
 
         browser.close()
 
