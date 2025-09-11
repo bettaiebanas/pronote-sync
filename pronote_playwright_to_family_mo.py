@@ -12,25 +12,26 @@ from googleapiclient.errors import HttpError
 
 # ========= CONFIG =========
 ENT_URL       = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
-PRONOTE_URL   = os.getenv("PRONOTE_URL", "")       # si vide, on clique la tuile PRONOTE depuis l’ENT
+PRONOTE_URL   = os.getenv("PRONOTE_URL", "")     # si vide: on clique la tuile PRONOTE depuis l’ENT
 ENT_USER      = os.getenv("PRONOTE_USER", "")
 ENT_PASS      = os.getenv("PRONOTE_PASS", "")
 
-TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
-TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
-TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
+# Sélecteurs (optionnels) fournis par toi
+TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()   # ex: #GInterface\.Instances\[0\]\.Instances\[1\]_Combo5
+TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()       # ex: #GInterface\.Instances\[0\]\.Instances\[1\]_Liste_niveau5 > ul > li:nth-child(1) > div > div
+TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()          # si l’EDT est dans un frame précis (sous-chaîne d’URL)
 
-WEEK_TAB_TEMPLATE = os.getenv("WEEK_TAB_TEMPLATE", "").strip()
+# Onglets semaine
+WEEK_TAB_TEMPLATE = os.getenv("WEEK_TAB_TEMPLATE", "").strip()             # ex: #GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}
 FETCH_WEEKS_FROM  = int(os.getenv("FETCH_WEEKS_FROM", "1"))
-WEEKS_TO_FETCH    = int(os.getenv("WEEKS_TO_FETCH", "2"))  # remplace l’ancienne constante si tu en avais une
+WEEKS_TO_FETCH    = int(os.getenv("WEEKS_TO_FETCH", "6"))                  # ≈ 1 mois+
 
 WAIT_AFTER_NAV_MS = int(os.getenv("WAIT_AFTER_NAV_MS", "800"))
 CLICK_TOUT_VOIR   = os.getenv("CLICK_TOUT_VOIR", "1") == "1"
 
 CALENDAR_ID   = os.getenv("CALENDAR_ID", "family15066434840617961429@group.calendar.google.com")
 TITLE_PREFIX  = "[Mo] "
-COLOR_ID      = "6"                                 # 6 = orange
-WEEKS_TO_FETCH = int(os.getenv("WEEKS_TO_FETCH", "6"))  # ≈ 1 mois+
+COLOR_ID      = "6"                                                        # 6 = orange
 HEADFUL       = os.getenv("HEADFUL", "0") == "1"
 
 CREDENTIALS_FILE = "credentials.json"
@@ -39,7 +40,7 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 # Timeouts (ms)
 TIMEOUT_MS  = 120_000
-SCREEN_DIR  = "screenshots"  # captures auto (uploadées en artifact)
+SCREEN_DIR  = "screenshots"
 
 # ========= Google Calendar =========
 def get_gcal_service():
@@ -61,7 +62,7 @@ def get_gcal_service():
             f.write(creds.to_json())
     return build("calendar", "v3", credentials=creds)
 
-# ---- Dédup béton : eventId stable (au lieu de dépendre d’une recherche) ----
+# ---- Dédup béton : eventId stable ----
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
     s = re.sub(r"\s+", " ", s).strip().lower()
@@ -69,18 +70,15 @@ def _norm(s: str) -> str:
 
 def make_event_id(start: datetime, end: datetime, title: str, location: str) -> str:
     key = f"{start.isoformat()}|{end.isoformat()}|{_norm(title)}|{_norm(location)}"
-    # id Google doit être [a-z0-9_-] max ~1024 ; on fait court/stable
-    return "prn_" + hashlib.sha1(key.encode()).hexdigest()[:24]
+    return "prn_" + hashlib.sha1(key.encode()).hexdigest()[:24]  # conforme à l’alphabet Google
 
 def upsert_event_by_id(svc, cal_id: str, event_id: str, body: Dict[str, Any]) -> str:
     try:
-        # existe ? → patch
         svc.events().get(calendarId=cal_id, eventId=event_id).execute()
         svc.events().patch(calendarId=cal_id, eventId=event_id, body=body, sendUpdates="none").execute()
         return "updated"
     except HttpError as e:
         if getattr(e, "resp", None) and e.resp.status == 404:
-            # n'existe pas → insert en imposant le même eventId
             svc.events().insert(calendarId=cal_id, body=body, eventId=event_id, sendUpdates="none").execute()
             return "created"
         raise
@@ -148,15 +146,11 @@ def click_first_in_frames(page, selectors: List[str]) -> bool:
     return False
 
 def accept_cookies_any(page):
-    texts = [
-        "Tout accepter","Accepter tout","J'accepte","Accepter",
-        "OK","Continuer","J’ai compris","J'ai compris"
-    ]
+    texts = ["Tout accepter","Accepter tout","J'accepte","Accepter","OK","Continuer","J’ai compris","J'ai compris"]
     sels = [f'button:has-text("{t}")' for t in texts] + [f'role=button[name="{t}"]' for t in texts]
     click_first_in_frames(page, sels)
 
 def _frame_has_timetable_js():
-    # Détection permissive : texte “Emploi du temps” + empreintes d’horaires / période
     return r"""
       () => {
         const txt = (document.body.innerText || '').replace(/\s+/g,' ');
@@ -168,7 +162,6 @@ def _frame_has_timetable_js():
     """
 
 def wait_timetable_any_frame(page, timeout_ms=120_000):
-    """Retourne le frame qui contient l’EDT (ou lève un TimeoutError)."""
     deadline = time.time() + timeout_ms/1000.0
     js = _frame_has_timetable_js()
     while time.time() < deadline:
@@ -185,10 +178,8 @@ def wait_for_timetable_ready(page, timeout_ms=TIMEOUT_MS):
     return wait_timetable_any_frame(page, timeout_ms=timeout_ms)
 
 def click_text_anywhere(page, patterns: List[str]) -> bool:
-    """Clique un élément cliquable dont le texte matche un pattern, dans n’importe quel frame."""
     for frame in page.frames:
         for pat in patterns:
-            # 1) rôles accessibles
             for loc in [
                 frame.get_by_role("link", name=re.compile(pat, re.I)),
                 frame.get_by_role("button", name=re.compile(pat, re.I)),
@@ -199,7 +190,6 @@ def click_text_anywhere(page, patterns: List[str]) -> bool:
                         return True
                 except:
                     pass
-            # 2) fallback JS
             try:
                 found = frame.evaluate(
                     r"""
@@ -227,6 +217,28 @@ def click_text_anywhere(page, patterns: List[str]) -> bool:
                     return True
             except:
                 pass
+    return False
+
+def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot_tag: str = "") -> bool:
+    """Clique un sélecteur CSS dans n’importe quel frame (facultativement filtré par URL de frame)."""
+    if not css:
+        return False
+    for fr in page.frames:
+        if frame_url_contains and frame_url_contains not in fr.url:
+            continue
+        try:
+            loc = fr.locator(css)
+            if loc.count() > 0:
+                loc.first.click()
+                page.wait_for_timeout(WAIT_AFTER_NAV_MS)
+                if screenshot_tag:
+                    try:
+                        page.screenshot(path=f"{SCREEN_DIR}/08-clicked-{screenshot_tag}.png", full_page=True)
+                    except:
+                        pass
+                return True
+        except Exception as e:
+            print(f"[NAV] click_css_in_frames fail in {fr.url}: {e}")
     return False
 
 # ========= Navigation =========
@@ -278,7 +290,6 @@ def login_ent(page):
 
     user_loc.fill(ENT_USER)
     pass_loc.fill(ENT_PASS)
-
     if not click_first_in_frames(page, submit_candidates):
         user_loc.press("Enter")
 
@@ -313,51 +324,11 @@ def open_pronote(context, page):
     pronote_page.screenshot(path=f"{SCREEN_DIR}/07-pronote-home.png", full_page=True)
     return pronote_page
 
-def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot_tag: str = "") -> bool:
-    """
-    Clique le premier élément correspondant au sélecteur CSS dans n'importe quel frame.
-    Si frame_url_contains est non vide, ne clique que dans les frames dont l'URL contient cette sous-chaîne.
-    """
-    if not css:
-        return False
-    for fr in page.frames:
-        if frame_url_contains and frame_url_contains not in fr.url:
-            continue
-        try:
-            loc = fr.locator(css)
-            if loc.count() > 0:
-                loc.first.click()
-                if screenshot_tag:
-                    try: page.screenshot(path=f"{SCREEN_DIR}/08-clicked-{screenshot_tag}.png", full_page=True)
-                    except: pass
-                return True
-        except Exception as e:
-            print(f"[NAV] click_css_in_frames fail in {fr.url}: {e}")
-    return False
-
-def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot_tag: str = "") -> bool:
-    if not css:
-        return False
-    for fr in page.frames:
-        if frame_url_contains and frame_url_contains not in fr.url:
-            continue
-        try:
-            loc = fr.locator(css)
-            if loc.count() > 0:
-                loc.first.click()
-                page.wait_for_timeout(WAIT_AFTER_NAV_MS)
-                if screenshot_tag:
-                    try: page.screenshot(path=f"{SCREEN_DIR}/08-clicked-{screenshot_tag}.png", full_page=True)
-                    except: pass
-                return True
-        except Exception as e:
-            print(f"[NAV] click_css_in_frames fail in {fr.url}: {e}")
-    return False
-
 def goto_timetable(pronote_page):
     pronote_page.set_default_timeout(TIMEOUT_MS)
     accept_cookies_any(pronote_page)
-     # 0) Ton chemin “perso” : Vie scolaire -> Emploi du temps
+
+    # Chemin manuel fourni (Vie scolaire -> Emploi du temps)
     if TIMETABLE_PRE_SELECTOR:
         click_css_in_frames(pronote_page, TIMETABLE_PRE_SELECTOR, TIMETABLE_FRAME, "pre-selector")
 
@@ -370,9 +341,6 @@ def goto_timetable(pronote_page):
                 return fr2
             except TimeoutError:
                 pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-custom-timeout.png", full_page=True)
-                # on tombera sur les heuristiques existantes plus bas
-
-    os.makedirs(SCREEN_DIR, exist_ok=True)
 
     # 0) Déjà sur l’EDT ?
     try:
@@ -387,7 +355,6 @@ def goto_timetable(pronote_page):
         ["Planning", "Agenda"],
         ["Vie scolaire", "Emploi du temps"],
     ]
-
     for i, pats in enumerate(attempts, 1):
         for pat in pats:
             if click_text_anywhere(pronote_page, [pat]):
@@ -410,7 +377,6 @@ def goto_timetable(pronote_page):
 
 def ensure_all_visible(page):
     if CLICK_TOUT_VOIR:
-        # plusieurs variantes possibles selon les instances PRONOTE
         click_text_anywhere(page, ["Tout voir", "Voir tout", "Tout afficher"])
         page.wait_for_timeout(400)
 
@@ -498,9 +464,9 @@ def run():
         pronote = open_pronote(context, page)
         goto_timetable(pronote)
 
-        # --- Boucle semaines (via onglets j_n) ---
-        start_idx = max(1, int(os.getenv("FETCH_WEEKS_FROM", "1")))
-        end_idx   = start_idx + max(1, int(os.getenv("WEEKS_TO_FETCH", "3"))) - 1
+        # --- Boucle semaines via tes onglets j_n ---
+        start_idx = max(1, FETCH_WEEKS_FROM)
+        end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
 
         for week_idx in range(start_idx, end_idx + 1):
             used_tab = goto_week_by_index(pronote, week_idx)
@@ -528,8 +494,8 @@ def run():
                 if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=90)):
                     continue
 
-                title = f"{TITLE_PREFIX}{(parsed['summary'] or 'Cours').strip()}"
-                hash_id = make_hash_id(start_dt, end_dt, title, parsed["room"])
+                title   = f"{TITLE_PREFIX}{(parsed['summary'] or 'Cours').strip()}"
+                event_id = make_event_id(start_dt, end_dt, title, parsed["room"])
 
                 event = {
                     "summary": title,
@@ -537,11 +503,11 @@ def run():
                     "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Paris"},
                     "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "Europe/Paris"},
                     "colorId": COLOR_ID,
-                    "extendedProperties": {"private": {"mo_hash": hash_id, "source": "pronote_playwright"}},
+                    "extendedProperties": {"private": {"source": "pronote_playwright"}},
                 }
 
                 try:
-                    action = upsert_event_by_hash(svc, CALENDAR_ID, hash_id, event)
+                    action = upsert_event_by_id(svc, CALENDAR_ID, event_id, event)
                     if action == "created":
                         created += 1
                     else:
@@ -549,7 +515,7 @@ def run():
                 except HttpError as e:
                     print(f"[GCAL] {e}")
 
-            # Si aucun onglet cliqué, tenter "Semaine suivante" en secours
+            # Si aucun onglet cliqué, tenter "Semaine suivante"
             if not used_tab and week_idx < end_idx:
                 if not iter_next_week(pronote):
                     break
@@ -558,64 +524,7 @@ def run():
 
     print(f"Terminé. créés={created}, maj={updated}")
 
-        # Parcours n semaines
-# --- Parcours des semaines via tes onglets j_n ---
-start_idx = max(1, FETCH_WEEKS_FROM)
-end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
-
-for week_idx in range(start_idx, end_idx + 1):
-    # Essaie d'aller directement sur j_1, j_2, j_3…
-    used_tab = goto_week_by_index(pronote, week_idx)
-
-    accept_cookies_any(pronote)
-    ensure_all_visible(pronote)  # clique “Tout voir” si activé
-
-    info  = extract_week_info(pronote)
-    d0    = info["monday"]
-    tiles = info["tiles"] or []
-    hdr   = (info.get("header") or "").replace("\n", " ")[:120]
-    print(f"Semaine {week_idx}: {len(tiles)} cases, header='{hdr}'")
-
-    for t in tiles:
-        label = (t.get("label") or "").strip()
-        if not label:
-            continue
-        parsed = parse_aria_label(label)
-        if not parsed["start"] or not parsed["end"]:
-            continue
-
-        start_dt = to_datetime(d0, t.get("dayIndex"), parsed["start"])
-        end_dt   = to_datetime(d0, t.get("dayIndex"), parsed["end"])
-
-        now = datetime.now()
-        if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=90)):
-            continue
-
-        title = f"{TITLE_PREFIX}{(parsed['summary'] or 'Cours').strip()}"
-        hash_id = make_hash_id(start_dt, end_dt, title, parsed["room"])
-
-        event = {
-            "summary": title,
-            "location": parsed["room"],
-            "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Paris"},
-            "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "Europe/Paris"},
-            "colorId": COLOR_ID,
-            "extendedProperties": {"private": {"mo_hash": hash_id, "source": "pronote_playwright"}},
-        }
-
-        try:
-            action = upsert_event_by_hash(svc, CALENDAR_ID, hash_id, event)
-            if action == "created": created += 1
-            else: updated += 1
-        except HttpError as e:
-            print(f"[GCAL] {e}")
-
-    # Si on n'a pas pu cliquer j_n, on tente le bouton “semaine suivante” en fallback
-    if not used_tab and week_idx < end_idx:
-        if not iter_next_week(pronote):
-            break
-
-
+# --- ENTRYPOINT ---
 if __name__ == "__main__":
     try:
         run()
