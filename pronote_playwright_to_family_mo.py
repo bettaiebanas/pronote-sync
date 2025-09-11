@@ -493,14 +493,14 @@ def run():
         page = context.new_page()
         page.set_default_timeout(TIMEOUT_MS)
 
-        # ENT → PRONOTE
+        # ENT → PRONOTE → Emploi du temps
         login_ent(page)
         pronote = open_pronote(context, page)
         goto_timetable(pronote)
 
-        # --- Parcours des semaines via tes onglets j_n ---
-        start_idx = max(1, FETCH_WEEKS_FROM)
-        end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
+        # --- Boucle semaines (via onglets j_n) ---
+        start_idx = max(1, int(os.getenv("FETCH_WEEKS_FROM", "1")))
+        end_idx   = start_idx + max(1, int(os.getenv("WEEKS_TO_FETCH", "3"))) - 1
 
         for week_idx in range(start_idx, end_idx + 1):
             used_tab = goto_week_by_index(pronote, week_idx)
@@ -542,11 +542,14 @@ def run():
 
                 try:
                     action = upsert_event_by_hash(svc, CALENDAR_ID, hash_id, event)
-                    if action == "created": created += 1
-                    else: updated += 1
+                    if action == "created":
+                        created += 1
+                    else:
+                        updated += 1
                 except HttpError as e:
                     print(f"[GCAL] {e}")
 
+            # Si aucun onglet cliqué, tenter "Semaine suivante" en secours
             if not used_tab and week_idx < end_idx:
                 if not iter_next_week(pronote):
                     break
@@ -554,7 +557,6 @@ def run():
         browser.close()
 
     print(f"Terminé. créés={created}, maj={updated}")
-
 
         # Parcours n semaines
 # --- Parcours des semaines via tes onglets j_n ---
