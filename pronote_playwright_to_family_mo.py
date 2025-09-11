@@ -10,29 +10,26 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# ========= CONFIG =========
+# ========= CONFIG (mêmes noms qu'avant) =========
 ENT_URL       = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
-PRONOTE_URL   = os.getenv("PRONOTE_URL", "")     # si vide: on clique la tuile PRONOTE depuis l’ENT
+PRONOTE_URL   = os.getenv("PRONOTE_URL", "")     # si vide: clic sur la tuile PRONOTE depuis l’ENT
 ENT_USER      = os.getenv("PRONOTE_USER", "")
 ENT_PASS      = os.getenv("PRONOTE_PASS", "")
 
-# Sélecteurs (optionnels) fournis par toi
-TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()   # ex: #GInterface\.Instances\[0\]\.Instances\[1\]_Combo5
-TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()       # ex: #GInterface\.Instances\[0\]\.Instances\[1\]_Liste_niveau5 > ul > li:nth-child(1) > div > div
-TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()          # si l’EDT est dans un frame précis (sous-chaîne d’URL)
-
-# Onglets semaine
-WEEK_TAB_TEMPLATE = os.getenv("WEEK_TAB_TEMPLATE", "").strip()             # ex: #GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}
-FETCH_WEEKS_FROM  = int(os.getenv("FETCH_WEEKS_FROM", "1"))
-WEEKS_TO_FETCH    = int(os.getenv("WEEKS_TO_FETCH", "6"))                  # ≈ 1 mois+
-
-WAIT_AFTER_NAV_MS = int(os.getenv("WAIT_AFTER_NAV_MS", "800"))
-CLICK_TOUT_VOIR   = os.getenv("CLICK_TOUT_VOIR", "1") == "1"
-
 CALENDAR_ID   = os.getenv("CALENDAR_ID", "family15066434840617961429@group.calendar.google.com")
 TITLE_PREFIX  = "[Mo] "
-COLOR_ID      = "6"                                                        # 6 = orange
+COLOR_ID      = "6"                              # 6 = orange
 HEADFUL       = os.getenv("HEADFUL", "0") == "1"
+
+# (facultatifs: laissent vide si tu ne veux pas les gérer côté workflow)
+TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
+TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
+TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
+WEEK_TAB_TEMPLATE      = os.getenv("WEEK_TAB_TEMPLATE", "").strip()  # ex: #GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}
+FETCH_WEEKS_FROM       = int(os.getenv("FETCH_WEEKS_FROM", "1"))
+WEEKS_TO_FETCH         = int(os.getenv("WEEKS_TO_FETCH", "6"))       # ≈ 1 mois
+CLICK_TOUT_VOIR        = os.getenv("CLICK_TOUT_VOIR", "1") == "1"
+WAIT_AFTER_NAV_MS      = int(os.getenv("WAIT_AFTER_NAV_MS", "800"))
 
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
@@ -62,24 +59,29 @@ def get_gcal_service():
             f.write(creds.to_json())
     return build("calendar", "v3", credentials=creds)
 
-# ---- Dédup béton : eventId stable ----
+# ---- Dédup béton : id d’événement stable ----
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
 
 def make_event_id(start: datetime, end: datetime, title: str, location: str) -> str:
+    # Alphabet autorisé: a-z 0-9 _ -
     key = f"{start.isoformat()}|{end.isoformat()}|{_norm(title)}|{_norm(location)}"
-    return "prn_" + hashlib.sha1(key.encode()).hexdigest()[:24]  # conforme à l’alphabet Google
+    return "prn_" + hashlib.sha1(key.encode()).hexdigest()[:24]
 
 def upsert_event_by_id(svc, cal_id: str, event_id: str, body: Dict[str, Any]) -> str:
     try:
+        # existe ?
         svc.events().get(calendarId=cal_id, eventId=event_id).execute()
         svc.events().patch(calendarId=cal_id, eventId=event_id, body=body, sendUpdates="none").execute()
         return "updated"
     except HttpError as e:
         if getattr(e, "resp", None) and e.resp.status == 404:
-            svc.events().insert(calendarId=cal_id, body=body, eventId=event_id, sendUpdates="none").execute()
+            # crée avec le même id (mettre l'id DANS le body)
+            body2 = dict(body)
+            body2["id"] = event_id
+            svc.events().insert(calendarId=cal_id, body=body2, sendUpdates="none").execute()
             return "created"
         raise
 
@@ -220,7 +222,7 @@ def click_text_anywhere(page, patterns: List[str]) -> bool:
     return False
 
 def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot_tag: str = "") -> bool:
-    """Clique un sélecteur CSS dans n’importe quel frame (facultativement filtré par URL de frame)."""
+    """Clique un sélecteur CSS dans n’importe quel frame (facultatif)."""
     if not css:
         return False
     for fr in page.frames:
@@ -328,10 +330,9 @@ def goto_timetable(pronote_page):
     pronote_page.set_default_timeout(TIMEOUT_MS)
     accept_cookies_any(pronote_page)
 
-    # Chemin manuel fourni (Vie scolaire -> Emploi du temps)
+    # Chemin manuel (facultatif) : Vie scolaire -> Emploi du temps
     if TIMETABLE_PRE_SELECTOR:
         click_css_in_frames(pronote_page, TIMETABLE_PRE_SELECTOR, TIMETABLE_FRAME, "pre-selector")
-
     if TIMETABLE_SELECTOR:
         if click_css_in_frames(pronote_page, TIMETABLE_SELECTOR, TIMETABLE_FRAME, "timetable-selector"):
             accept_cookies_any(pronote_page)
@@ -342,7 +343,7 @@ def goto_timetable(pronote_page):
             except TimeoutError:
                 pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-custom-timeout.png", full_page=True)
 
-    # 0) Déjà sur l’EDT ?
+    # Déjà dessus ?
     try:
         fr = wait_timetable_any_frame(pronote_page, timeout_ms=10_000)
         pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-already-here.png", full_page=True)
@@ -464,7 +465,7 @@ def run():
         pronote = open_pronote(context, page)
         goto_timetable(pronote)
 
-        # --- Boucle semaines via tes onglets j_n ---
+        # Parcours des semaines (onglets j_n si fournis, sinon reste sur la semaine courante)
         start_idx = max(1, FETCH_WEEKS_FROM)
         end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
 
@@ -494,7 +495,7 @@ def run():
                 if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=90)):
                     continue
 
-                title   = f"{TITLE_PREFIX}{(parsed['summary'] or 'Cours').strip()}"
+                title    = f"{TITLE_PREFIX}{(parsed['summary'] or 'Cours').strip()}"
                 event_id = make_event_id(start_dt, end_dt, title, parsed["room"])
 
                 event = {
@@ -515,7 +516,7 @@ def run():
                 except HttpError as e:
                     print(f"[GCAL] {e}")
 
-            # Si aucun onglet cliqué, tenter "Semaine suivante"
+            # fallback si pas d’onglet semaine
             if not used_tab and week_idx < end_idx:
                 if not iter_next_week(pronote):
                     break
