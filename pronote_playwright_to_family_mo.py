@@ -498,6 +498,64 @@ def run():
         pronote = open_pronote(context, page)
         goto_timetable(pronote)
 
+        # --- Parcours des semaines via tes onglets j_n ---
+        start_idx = max(1, FETCH_WEEKS_FROM)
+        end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
+
+        for week_idx in range(start_idx, end_idx + 1):
+            used_tab = goto_week_by_index(pronote, week_idx)
+            accept_cookies_any(pronote)
+            ensure_all_visible(pronote)
+
+            info  = extract_week_info(pronote)
+            d0    = info["monday"]
+            tiles = info["tiles"] or []
+            hdr   = (info.get("header") or "").replace("\n", " ")[:120]
+            print(f"Semaine {week_idx}: {len(tiles)} cases, header='{hdr}'")
+
+            for t in tiles:
+                label = (t.get("label") or "").strip()
+                if not label:
+                    continue
+                parsed = parse_aria_label(label)
+                if not parsed["start"] or not parsed["end"]:
+                    continue
+
+                start_dt = to_datetime(d0, t.get("dayIndex"), parsed["start"])
+                end_dt   = to_datetime(d0, t.get("dayIndex"), parsed["end"])
+
+                now = datetime.now()
+                if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=90)):
+                    continue
+
+                title = f"{TITLE_PREFIX}{(parsed['summary'] or 'Cours').strip()}"
+                hash_id = make_hash_id(start_dt, end_dt, title, parsed["room"])
+
+                event = {
+                    "summary": title,
+                    "location": parsed["room"],
+                    "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Paris"},
+                    "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "Europe/Paris"},
+                    "colorId": COLOR_ID,
+                    "extendedProperties": {"private": {"mo_hash": hash_id, "source": "pronote_playwright"}},
+                }
+
+                try:
+                    action = upsert_event_by_hash(svc, CALENDAR_ID, hash_id, event)
+                    if action == "created": created += 1
+                    else: updated += 1
+                except HttpError as e:
+                    print(f"[GCAL] {e}")
+
+            if not used_tab and week_idx < end_idx:
+                if not iter_next_week(pronote):
+                    break
+
+        browser.close()
+
+    print(f"Terminé. créés={created}, maj={updated}")
+
+
         # Parcours n semaines
 # --- Parcours des semaines via tes onglets j_n ---
 start_idx = max(1, FETCH_WEEKS_FROM)
