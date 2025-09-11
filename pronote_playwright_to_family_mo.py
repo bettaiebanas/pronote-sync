@@ -363,52 +363,65 @@ def goto_week_by_index(page, n: int) -> bool:
     return ok
 
 # ========= Extraction =========
-def extract_week_info(pronote_page) -> Dict[str, Any]:
-    # En-tête (lundi..vendredi)
-    header_text = ""
-    for sel in ['text=/Semaine .* au .*/', '.titrePeriode', '.zoneSemaines', 'header']:
-        loc = first_locator_in_frames(pronote_page, [sel])
-        if loc:
-            try:
-                header_text = loc.inner_text()
-                if header_text: break
-            except: pass
-    d0 = monday_of_header(header_text)
+MONTHS_FR = {
+    "janvier":1,"février":2,"fevrier":2,"mars":3,"avril":4,"mai":5,"juin":6,
+    "juillet":7,"août":8,"aout":8,"septembre":9,"octobre":10,"novembre":11,"décembre":12,"decembre":12
+}
 
-    # 1) Méthode “Pronote moderne” : div.cours-simple + détails cont*
-    tiles = pronote_page.evaluate(r"""
+def parse_aria_course(aria: str, header: str):
+    """
+    aria: 'Cours du 8 septembre de 9 heures 05 à 10 heures 00'
+    header: 'du 08/09/2025 au 12/09/2025'  -> on récupère l'année
+    """
+    y = None
+    m = re.search(r'du\s+(\d{2})/(\d{2})/(\d{4})', header)
+    if m:
+        y = int(m.group(3))
+    rx = re.search(r'Cours du\s+(\d{1,2})\s+([a-zéûôîàèù]+)\s+de\s+(\d{1,2})\D?(\d{2})\s+à\s+(\d{1,2})\D?(\d{2})', aria, re.I)
+    if not rx:
+        return None, None
+    d, mois = int(rx.group(1)), rx.group(2).lower()
+    sh, sm, eh, em = map(int, (rx.group(3), rx.group(4), rx.group(5), rx.group(6)))
+    mm = MONTHS_FR.get(mois)
+    if not (y and mm):
+        return None, None
+    start = datetime(y, mm, d, sh, sm)
+    end   = datetime(y, mm, d, eh, em)
+    return start, end
+
+def guess_room(text_block: str) -> str:
+    lines = [l.strip() for l in (text_block or "").splitlines() if l.strip()]
+    # souvent la salle est la dernière ligne (ex: '004' ou 'S11', 'L12')
+    for l in reversed(lines):
+        if re.search(r'\b([A-Z]{1,3}\d{1,3}|0\d{2}|S\d{1,2}|L\d{1,2})\b', l):
+            return l
+    return ""
+
+
+
+def extract_week_info(pronote_page) -> Dict[str, Any]:
+    # on s’assure qu’on est bien sur la frame EDT
+    fr = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
+
+    data = fr.evaluate(r"""
     () => {
-      const out = [];
-      document.querySelectorAll('div.cours-simple[id*="_coursInt_"]').forEach(cs => {
-        const label = cs.getAttribute('aria-label') || '';
-        let details = '';
-        const root = cs.closest('div[id*="_cours_"]') || cs.parentElement;
-        if (root){
-          const lines = Array.from(root.querySelectorAll('td[id*="_cont"] div'))
-            .map(d => (d.innerText||'').trim())
-            .filter(Boolean);
-          details = lines.join(' | ');
-        }
-        out.push({label, details});
+      const res = { header:"", items:[] };
+
+      const headerMatch = (document.body.innerText||"")
+        .match(/du\s+\d{2}\/\d{2}\/\d{4}\s+au\s+\d{2}\/\d{2}\/\d{4}/i);
+      res.header = headerMatch ? headerMatch[0] : "";
+
+      document.querySelectorAll('div.cours-simple[aria-label^="Cours"]').forEach(c => {
+        const aria = c.getAttribute('aria-label') || '';
+        const tcell = c.querySelector('td[id$="_cont0"]');
+        const text  = tcell ? tcell.innerText : (c.innerText || "");
+        res.items.push({ aria, text });
       });
-      return out;
+      return res;
     }
     """)
 
-    # 2) Fallback (ancienne heuristique)
-    if not tiles:
-        tiles = pronote_page.evaluate(r"""
-        () => {
-          const out = [];
-          const add = (el, label) => { if (label) out.push({label, details:''}); };
-          const rx = /\d{1,2}\s*(?:h|:|heures?)\s*\d{2}.*\d{1,2}\s*(?:h|:|heures?)\s*\d{2}/i;
-          document.querySelectorAll('[aria-label]').forEach(e => { const v=e.getAttribute('aria-label'); if (v && rx.test(v)) add(e,v); });
-          document.querySelectorAll('[title]').forEach(e => { const v=e.getAttribute('title'); if (v && rx.test(v)) add(e,v); });
-          return out;
-        }
-        """)
-
-    return {"monday": d0, "tiles": tiles, "header": header_text}
+    return data
 
 # ========= Main =========
 def run():
@@ -436,68 +449,44 @@ def run():
             accept_cookies_any(pronote)
             ensure_all_visible(pronote)
 
-            info  = extract_week_info(pronote)
-            d0    = info["monday"]
-            tiles = info["tiles"] or []
-            hdr   = (info.get("header") or "").replace("\n"," ")[:160]
-            print(f"Semaine {week_idx}: {len(tiles)} cases, header='{hdr}'")
+           info = extract_week_info(pronote)
+hdr  = info.get("header","")
+items = info.get("items", [])
+print(f"Semaine {w+1}: {len(items)} cases, header='{hdr}'")
 
-            for t in tiles:
-                label   = (t.get("label") or "").strip()
-                details = (t.get("details") or "").strip()
-                if not label: 
-                    continue
+for it in items:
+    start_dt, end_dt = parse_aria_course(it.get("aria",""), hdr)
+    if not start_dt or not end_dt:
+        continue
 
-                times = parse_times_from_text(label)
-                if not times:
-                    # parfois les heures peuvent aussi se retrouver dans details
-                    times = parse_times_from_text(details)
-                if not times:
-                    continue
-                (h1,m1), (h2,m2) = times
+    # bornes (sécurité)
+    now = datetime.now()
+    if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=90)):
+        continue
 
-                day_idx = parse_dayindex_from_label(label, d0)
-                start_dt = to_datetime(d0, day_idx, (h1,m1))
-                end_dt   = to_datetime(d0, day_idx, (h2,m2))
+    block_text = it.get("text","").strip()
+    summary = (block_text.splitlines()[0].strip() if block_text else "Cours")
+    room    = guess_room(block_text)
 
-                now = datetime.now()
-                # filtre fenêtre raisonnable
-                if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=120)):
-                    continue
+    title = f"{TITLE_PREFIX}{summary}"
+    hash_id = make_hash_id(start_dt, end_dt, title, room)  # ta dédup existante
 
-                summary_text = clean_summary_text(details if details else label)
-                title = f"{TITLE_PREFIX}{summary_text}"[:200]
+    event = {
+        "summary": title,
+        "location": room,
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Paris"},
+        "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "Europe/Paris"},
+        "colorId": COLOR_ID,
+        "extendedProperties": {"private": {"mo_hash": hash_id, "source": "pronote_playwright"}},
+    }
 
-                hash_id = make_hash_id(start_dt, end_dt, title, "")
-                event = {
-                    "summary": title,
-                    "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Paris"},
-                    "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "Europe/Paris"},
-                    "colorId": COLOR_ID,
-                    "extendedProperties": {"private": {"mo_hash": hash_id, "source": "pronote_playwright"}},
-                }
-                try:
-                    action = upsert_event_by_hash(svc, CALENDAR_ID, hash_id, event)
-                    if action == "created": created += 1
-                    else: updated += 1
-                except HttpError as e:
-                    print(f"[GCAL] {e}")
+    try:
+        action = upsert_event_by_hash(svc, CALENDAR_ID, hash_id, event)
+        if action == "created": created += 1
+        else: updated += 1
+    except HttpError as e:
+        print(f"[GCAL] {e}")
 
-            if not used_tab and week_idx < end_idx:
-                # secours : bouton “Semaine suivante”
-                if not click_first_in_frames(pronote, [
-                    'button[title*="suivante"]','button[aria-label*="suivante"]',
-                    'a[title*="suivante"]','a:has-text("Semaine suivante")'
-                ]):
-                    break
-                accept_cookies_any(pronote)
-                try: wait_timetable_any_frame(pronote, timeout_ms=15_000)
-                except TimeoutError: pass
-                pronote.screenshot(path=f"{SCREEN_DIR}/09-pronote-next-week.png", full_page=True)
-
-        browser.close()
-
-    print(f"Terminé. créés={created}, maj={updated}")
 
 if __name__ == "__main__":
     try:
