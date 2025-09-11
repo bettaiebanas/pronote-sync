@@ -394,46 +394,71 @@ def goto_week_by_index(page, n: int) -> bool:
     return ok
 
 def extract_week_info(pronote_page) -> Dict[str, Any]:
-    header_text = ""
-    for sel in ['text=/Semaine .* au .*/', '.titrePeriode', '.zoneSemaines', 'header']:
-        loc = first_locator_in_frames(pronote_page, [sel])
-        if loc:
-            try:
-                header_text = loc.inner_text()
-                if header_text:
-                    break
-            except:
-                pass
+    """
+    Récupère les tuiles de cours depuis le FRAME qui contient l'EDT.
+    On lit aussi le texte (du .. au ..) pour dater la semaine.
+    """
+    # 1) Trouver le frame de l'EDT
+    fr = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
 
-    d0 = monday_of_week(header_text)
-
-    tiles = pronote_page.evaluate(r"""
-    () => {
-      const out = [];
-      const add = (el, label) => {
-        if (!label) return;
-        let dayIndex = null, p = el;
-        while (p) {
-          if (p.getAttribute && p.getAttribute('data-dayindex')) { dayIndex = parseInt(p.getAttribute('data-dayindex')); break; }
-          p = p.parentElement;
-        }
-        out.push({ label, dayIndex });
-      };
-      const rx = /\d{1,2}[:hH]\d{2}.*\d{1,2}[:hH]\d{2}/;
-      document.querySelectorAll('[aria-label]').forEach(e => {
-        const v = e.getAttribute('aria-label'); if (v && rx.test(v)) add(e, v);
-      });
-      document.querySelectorAll('[title]').forEach(e => {
-        const v = e.getAttribute('title'); if (v && rx.test(v)) add(e, v);
-      });
-      document.querySelectorAll('*').forEach(e => {
-        const t = (e.innerText || '').trim();
-        if (t && rx.test(t) && t.length < 160) add(e, t);
-      });
-      return out;
-    }
+    # 2) Chercher le header (du 08/09/2025 au 12/09/2025) dans CE frame
+    header_text = fr.evaluate(r"""
+      () => {
+        const txt = (document.body.innerText || '').replace(/\s+/g,' ');
+        const m = txt.match(/du\s+\d{2}\/\d{2}\/\d{4}\s+au\s+\d{2}\/\d{2}\/\d{4}/i);
+        return m ? m[0] : '';
+      }
     """)
+
+    # 3) Extraire les "tiles" dans CE frame (aria-label, title ou innerText court)
+    tiles = fr.evaluate(r"""
+      () => {
+        const out = [];
+        const add = (el, label) => {
+          if (!label) return;
+          // essaie de retrouver le dayIndex en remontant
+          let dayIndex = null, p = el;
+          while (p) {
+            if (p.getAttribute && p.getAttribute('data-dayindex')) {
+              const v = parseInt(p.getAttribute('data-dayindex'));
+              if (!Number.isNaN(v)) { dayIndex = v; }
+              break;
+            }
+            p = p.parentElement;
+          }
+          out.push({ label, dayIndex });
+        };
+
+        // "de 8h05 à 9h00", "08:05 … 09:00", etc.
+        const rx = /(\d{1,2}\s*[h:]\s*\d{2}).{0,60}(\d{1,2}\s*[h:]\s*\d{2})/i;
+
+        // 3.1 aria-label / title
+        document.querySelectorAll('[aria-label],[title]').forEach(e => {
+          const v = e.getAttribute('aria-label') || e.getAttribute('title') || '';
+          if (rx.test(v)) add(e, v);
+        });
+
+        // 3.2 fallback innerText (évite les textes trop longs)
+        Array.from(document.querySelectorAll('body *')).forEach(e => {
+          const t = (e.innerText || '').trim();
+          if (t && t.length < 200 && rx.test(t)) add(e, t);
+        });
+
+        return out;
+      }
+    """)
+
+    # 4) Convertir la date de début de semaine
+    d0 = None
+    try:
+        m = re.search(r'(\d{2}/\d{2}/\d{4}).*?(\d{2}/\d{2}/\d{4})', header_text or '')
+        if m:
+            d0 = datetime.strptime(m.group(1), "%d/%m/%Y")
+    except Exception:
+        d0 = None
+
     return {"monday": d0, "tiles": tiles, "header": header_text}
+
 
 def iter_next_week(pronote_page) -> bool:
     if click_first_in_frames(pronote_page, [
