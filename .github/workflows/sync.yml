@@ -20,15 +20,14 @@ jobs:
       ENT_URL:      https://ent77.seine-et-marne.fr/welcome
       PRONOTE_URL:  "https://0771342r.index-education.net/pronote/parent.html"
       HEADFUL:      "1"                  # mets "1" pour voir le navigateur sur le runner
-      WEEKS_TO_FETCH: "6"                # ~1 mois+
       TIMETABLE_PRE_SELECTOR: '#GInterface\.Instances\[0\]\.Instances\[1\]_Combo5'
       TIMETABLE_SELECTOR:     '#GInterface\.Instances\[0\]\.Instances\[1\]_Liste_niveau5 > ul > li:nth-child(1) > div > div'
       TIMETABLE_FRAME:        'parent.html'   # optionnel; mets '' si inutile
       # Onglets "Semaine 1/2/3…"
       WEEK_TAB_TEMPLATE: '#GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}'
       FETCH_WEEKS_FROM: '1'     # commence à j_1
-      WEEKS_TO_FETCH:   '4'     # j_1, j_2, j_3, j_4
-
+      WEEKS_TO_FETCH:   '4'     # j_1, j_2, j_3,j_4
+      
       # Petits timers confort
       WAIT_AFTER_NAV_MS: '1000'   # pause après chaque clic critique
       CLICK_TOUT_VOIR:   '1'      # clic auto sur “Tout voir”
