@@ -20,6 +20,13 @@ TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
 TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
 TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
 
+WEEK_TAB_TEMPLATE = os.getenv("WEEK_TAB_TEMPLATE", "").strip()
+FETCH_WEEKS_FROM  = int(os.getenv("FETCH_WEEKS_FROM", "1"))
+WEEKS_TO_FETCH    = int(os.getenv("WEEKS_TO_FETCH", "2"))  # remplace l’ancienne constante si tu en avais une
+
+WAIT_AFTER_NAV_MS = int(os.getenv("WAIT_AFTER_NAV_MS", "800"))
+CLICK_TOUT_VOIR   = os.getenv("CLICK_TOUT_VOIR", "1") == "1"
+
 CALENDAR_ID   = os.getenv("CALENDAR_ID", "family15066434840617961429@group.calendar.google.com")
 TITLE_PREFIX  = "[Mo] "
 COLOR_ID      = "6"                                 # 6 = orange
