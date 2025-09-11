@@ -1,5 +1,5 @@
 # pronote_playwright_to_family_mo.py
-import os, sys, re, hashlib, time
+import os, sys, re, hashlib, csv, time
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
@@ -16,7 +16,7 @@ PRONOTE_URL   = os.getenv("PRONOTE_URL", "")
 ENT_USER      = os.getenv("PRONOTE_USER", "")
 ENT_PASS      = os.getenv("PRONOTE_PASS", "")
 
-# Tes sélecteurs validés pour atteindre l’EDT
+# Sélecteurs validés chez toi
 TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
 TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
 TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
@@ -34,8 +34,11 @@ TITLE_PREFIX  = os.getenv("TITLE_PREFIX", "[Mo] ")
 COLOR_ID      = os.getenv("COLOR_ID", "6")
 HEADFUL       = os.getenv("HEADFUL", "0") == "1"
 
-# Fusion de créneaux consécutifs (même cours/salle, collés)
+# Fusion cours contigus (même titre/salle) si écart <= N minutes
 COALESCE_MINUTES = int(os.getenv("COALESCE_MINUTES", "5"))
+
+# Debug
+DEBUG = os.getenv("DEBUG", "1") == "1"
 
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
@@ -44,6 +47,13 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 # Timeouts (ms)
 TIMEOUT_MS  = 120_000
 SCREEN_DIR  = "screenshots"
+
+def log(*a):
+    print(*a, flush=True)
+
+def dbg(*a):
+    if DEBUG:
+        print("[DBG]", *a, flush=True)
 
 # ========= Google Calendar =========
 def get_gcal_service():
@@ -59,11 +69,24 @@ def get_gcal_service():
                 flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
                 creds = flow.run_local_server(port=0)
         except Exception as e:
-            print(f"[Google OAuth] {e}")
+            log(f"[Google OAuth] {e}")
             raise
         with open(TOKEN_FILE, "w", encoding="utf-8") as f:
             f.write(creds.to_json())
-    return build("calendar", "v3", credentials=creds)
+    svc = build("calendar", "v3", credentials=creds)
+
+    # Pré-vol : liste des agendas pour vérifier l’accès au CALENDAR_ID
+    try:
+        cals = svc.calendarList().list(maxResults=250).execute().get("items", [])
+        ids = [c.get("id") for c in cals]
+        found = CALENDAR_ID in ids
+        dbg(f"CalendarList loaded: {len(ids)} calendars. CALENDAR_ID present? {found}")
+        if not found:
+            log(f"[WARN] Le calendrier '{CALENDAR_ID}' n’est pas dans ta liste. "
+                f"Si c’est un agenda partagé (Famille), assure-toi d’y être abonné.")
+    except HttpError as e:
+        log(f"[GCAL] Pré-vol calendarList: {e}")
+    return svc
 
 # ---- Upsert idempotent via propriété étendue privée ----
 def make_hash_id(start: datetime, end: datetime, title: str, location: str) -> str:
@@ -71,26 +94,27 @@ def make_hash_id(start: datetime, end: datetime, title: str, location: str) -> s
     return hashlib.md5(base.encode("utf-8")).hexdigest()
 
 def find_event_by_hash(svc, cal_id: str, h: str):
-    resp = svc.events().list(
+    return svc.events().list(
         calendarId=cal_id,
         privateExtendedProperty=f"mo_hash={h}",
         singleEvents=True,
         maxResults=1,
         orderBy="startTime",
-    ).execute()
-    items = resp.get("items", [])
-    return items[0] if items else None
+    ).execute().get("items", [None])[0]
 
 def upsert_event_by_hash(svc, cal_id: str, h: str, body: Dict[str, Any]) -> str:
     existing = find_event_by_hash(svc, cal_id, h)
     if existing:
-        svc.events().update(calendarId=cal_id, eventId=existing["id"], body=body, sendUpdates="none").execute()
+        ev_id = existing["id"]
+        svc.events().update(calendarId=cal_id, eventId=ev_id, body=body, sendUpdates="none").execute()
+        dbg(f"update: {body.get('summary')} {body['start']['dateTime']} → {body['end']['dateTime']}")
         return "updated"
     else:
         svc.events().insert(calendarId=cal_id, body=body, sendUpdates="none").execute()
+        dbg(f"insert: {body.get('summary')} {body['start']['dateTime']} → {body['end']['dateTime']}")
         return "created"
 
-# ========= Parsing de créneaux =========
+# ========= Parsing créneaux =========
 HOUR_RE = re.compile(r'(?P<h>\d{1,2})\s*[:hH]\s*(?P<m>\d{2})')
 
 def parse_timespan(text: str):
@@ -135,10 +159,7 @@ def click_first_in_frames(page, selectors: List[str]) -> bool:
     return False
 
 def accept_cookies_any(page):
-    texts = [
-        "Tout accepter","Accepter tout","J'accepte","Accepter",
-        "OK","Continuer","J’ai compris","J'ai compris"
-    ]
+    texts = ["Tout accepter","Accepter tout","J'accepte","Accepter","OK","Continuer","J’ai compris","J'ai compris"]
     sels = [f'button:has-text("{t}")' for t in texts] + [f'role=button[name="{t}"]' for t in texts]
     click_first_in_frames(page, sels)
 
@@ -214,7 +235,7 @@ def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot
                     except: pass
                 return True
         except Exception as e:
-            print(f"[NAV] click_css_in_frames fail in {fr.url}: {e}")
+            log(f"[NAV] click_css_in_frames fail in {fr.url}: {e}")
     return False
 
 # ========= Navigation =========
@@ -264,9 +285,7 @@ def login_ent(page):
         page.screenshot(path=f"{SCREEN_DIR}/03-ent-no-fields.png", full_page=True)
         raise RuntimeError("Champ identifiant ENT introuvable. Mets HEADFUL=1 pour ajuster.")
 
-    user_loc.fill(ENT_USER)
-    pass_loc.fill(ENT_PASS)
-
+    user_loc.fill(ENT_USER); pass_loc.fill(ENT_PASS)
     if not click_first_in_frames(page, submit_candidates):
         user_loc.press("Enter")
 
@@ -367,29 +386,19 @@ def goto_week_by_index(page, n: int) -> bool:
             pass
     return ok
 
-# ========= Extraction basée sur les colonnes (dates par jour) =========
+# ========= Extraction (dates par colonne) =========
 def extract_week_items_with_dates(page_or_frame) -> Dict[str, Any]:
-    """
-    Dans la frame EDT :
-    - détecte chaque colonne jour (ids *_contX ou structures proches),
-    - lit la date affichée dans l'en-tête de la colonne (dd/mm ou dd/mm/yyyy),
-    - récupère les tuiles (aria-label/title/texte) dans cette colonne,
-    - produit {label, dayISO}.
-    """
     if hasattr(page_or_frame, "frames"):
         fr = wait_timetable_any_frame(page_or_frame, timeout_ms=10_000)
     else:
         fr = page_or_frame
 
-    # Essaie quand même de lire l'entête de semaine (utile en log)
     header_text = ""
     for sel in ['text=/Semaine .* au .*/', '.titrePeriode', '.zoneSemaines', 'header']:
         try:
             loc = fr.locator(sel)
             if loc.count() > 0:
-                header_text = (loc.first.inner_text() or "").strip()
-                if header_text:
-                    break
+                header_text = (loc.first.inner_text() or "").strip(); break
         except:
             pass
 
@@ -400,46 +409,45 @@ def extract_week_items_with_dates(page_or_frame) -> Dict[str, Any]:
       const headNode = document.querySelector('.titrePeriode, .zoneSemaines, header');
       if (headNode) out.header = (headNode.innerText || '').trim();
 
-      // Heuristique : colonnes jour souvent *_contX (0..6) ou éléments contenant un libellé avec une date.
-      const dayCols = Array.from(document.querySelectorAll('[id*="_cont"], [class*="col"], [class*="Jour"]'));
-
       const rxDate = /\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/;
       const rxTime = /\b\d{1,2}\s*(?:[:hH]|heures?)\s*\d{2}\s*(?:-|–|à)\s*\d{1,2}\s*(?:[:hH]|heures?)\s*\d{2}\b/i;
 
-      const pickDateText = (col) => {
-        // chercher d'abord dans des en-têtes proches
-        const candidates = [];
-        if (col.previousElementSibling) candidates.push(col.previousElementSibling);
-        if (col.firstElementChild) candidates.push(col.firstElementChild);
-        candidates.push(col);
+      // Colonnes jour — typiquement *_cont0..6 (ex: #id_145_cont0)
+      const dayCols = Array.from(document.querySelectorAll('[id$="_cont0"],[id$="_cont1"],[id$="_cont2"],[id$="_cont3"],[id$="_cont4"],[id$="_cont5"],[id$="_cont6"]'));
+      if (dayCols.length === 0) {
+        // fallback large (peut capter trop, mais on filtrera)
+        dayCols.push(...Array.from(document.querySelectorAll('[id*="_cont"], [class*="col"]')));
+      }
 
-        for (const c of candidates) {
-          const txt = (c.innerText || '').replace(/\s+/g,' ').trim();
+      const pickDateText = (col) => {
+        const spots = [];
+        if (col.previousElementSibling) spots.push(col.previousElementSibling);
+        if (col.firstElementChild)     spots.push(col.firstElementChild);
+        spots.push(col);
+        for (const s of spots) {
+          const txt = (s.innerText || '').replace(/\s+/g,' ').trim();
           const m = txt.match(rxDate);
           if (m) return m[0];
         }
-        // fallback: chercher dans toute la colonne
         const m2 = (col.innerText || '').match(rxDate);
-        if (m2) return m2[0];
-        return null;
+        return m2 ? m2[0] : null;
       };
 
       const findTilesInCol = (col) => {
         const tiles = [];
-        const add = (el, label) => { if (label) tiles.push({ el, label: String(label).trim() }); };
+        const add = (label) => { if (label) tiles.push({label: String(label).trim()}); };
 
-        col.querySelectorAll('[aria-label]').forEach(el => { const v=el.getAttribute('aria-label'); if (v && rxTime.test(v)) add(el, v); });
-        col.querySelectorAll('[title]').forEach(el => { const v=el.getAttribute('title');     if (v && rxTime.test(v)) add(el, v); });
+        col.querySelectorAll('[aria-label]').forEach(el => { const v=el.getAttribute('aria-label'); if (v && rxTime.test(v)) add(v); });
+        col.querySelectorAll('[title]').forEach(el => { const v=el.getAttribute('title');     if (v && rxTime.test(v)) add(v); });
 
-        // texte brut court
         col.querySelectorAll('*').forEach(el => {
           const t = (el.innerText || '').trim();
-          if (t && t.length < 220 && rxTime.test(t)) add(el, t);
+          if (t && t.length < 220 && rxTime.test(t)) add(t);
         });
 
-        // dédup local par (label)
+        // dédup local
         const seen = new Set(); const res = [];
-        for (const it of tiles) { if (!seen.has(it.label)) { seen.add(it.label); res.push({label: it.label}); } }
+        for (const it of tiles) { if (!seen.has(it.label)) { seen.add(it.label); res.push(it); } }
         return res;
       };
 
@@ -451,7 +459,7 @@ def extract_week_items_with_dates(page_or_frame) -> Dict[str, Any]:
         out.days.push({ dateText, tiles });
       }
 
-      // dédup global: même date + label
+      // dédup global
       const gseen = new Set(); const gdays = [];
       for (const d of out.days) {
         const uniqTiles = [];
@@ -465,44 +473,34 @@ def extract_week_items_with_dates(page_or_frame) -> Dict[str, Any]:
       return out;
     }
     """)
-
-    return js_result  # {header, days:[{dateText, tiles:[{label}]}]}
+    js_result["header"] = js_result["header"] or header_text
+    return js_result
 
 def guess_year_for_month(month: int) -> int:
     now = datetime.now()
-    # année scolaire : si mois <= 7 (janv–juil) et qu'on est en fin d'année (août–déc), c'est probablement l'année suivante
-    if month <= 7 and now.month >= 8:
-        return now.year + 1
-    return now.year
+    return now.year + 1 if (month <= 7 and now.month >= 8) else now.year
 
 def to_dt_from_date_and_hm(date_ddmm: str, hm: tuple) -> Optional[datetime]:
     try:
-        d, m = [int(x) for x in date_ddmm.split("/")]
-        y = guess_year_for_month(m)
+        parts = date_ddmm.strip().split("/")
+        d, m = int(parts[0]), int(parts[1])
+        y = int(parts[2]) if len(parts) >= 3 else guess_year_for_month(m)
         return datetime(y, m, d, hm[0], hm[1], 0)
     except Exception:
         return None
 
 def coalesce(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not entries:
-        return entries
+    if not entries: return entries
     items = sorted(entries, key=lambda e: (e["date"], e["title"], e["room"], e["start"]))
     merged = []
-
-    def minutes(dt: datetime) -> int:
-        return int(dt.timestamp() // 60)
-
+    def minutes(dt: datetime) -> int: return int(dt.timestamp() // 60)
     for e in items:
-        if not merged:
-            merged.append(e); continue
+        if not merged: merged.append(e); continue
         last = merged[-1]
-        if (e["date"] == last["date"] and
-            e["title"] == last["title"] and
-            (e["room"] or "") == (last["room"] or "")):
+        if (e["date"] == last["date"] and e["title"] == last["title"] and (e["room"] or "") == (last["room"] or "")):
             gap = minutes(e["start"]) - minutes(last["end"])
             if 0 <= gap <= COALESCE_MINUTES:
-                last["end"] = max(last["end"], e["end"])
-                continue
+                last["end"] = max(last["end"], e["end"]); continue
         merged.append(e)
     return merged
 
@@ -511,6 +509,7 @@ def run():
     if not ENT_USER or not ENT_PASS:
         raise SystemExit("Identifiants ENT manquants: PRONOTE_USER / PRONOTE_PASS.")
 
+    os.makedirs(SCREEN_DIR, exist_ok=True)
     svc = get_gcal_service()
     created = updated = 0
 
@@ -525,71 +524,96 @@ def run():
         pronote = open_pronote(context, page)
         goto_timetable(pronote)
         ensure_all_visible(pronote)
+        page.screenshot(path=f"{SCREEN_DIR}/08-EDT-visible.png", full_page=True)
 
         # Parcours des semaines (onglets j_n)
         start_idx = max(1, FETCH_WEEKS_FROM)
         end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
 
-        for week_idx in range(start_idx, end_idx + 1):
-            used = goto_week_by_index(pronote, week_idx)
-            ensure_all_visible(pronote)
+        # CSV debug
+        csv_path = os.path.join(SCREEN_DIR, "entries_debug.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as fcsv:
+            w = csv.writer(fcsv, delimiter=";")
+            w.writerow(["week_idx","date","start","end","title","room"])
 
-            data = extract_week_items_with_dates(pronote)  # {header, days:[{dateText, tiles:[{label}]}]}
-            hdr  = (data.get("header") or "").replace("\n"," ")[:160]
-            nb   = sum(len(d["tiles"]) for d in data.get("days", []))
-            print(f"Semaine {week_idx}: {nb} cours, header='{hdr}'")
+            for week_idx in range(start_idx, end_idx + 1):
+                used = goto_week_by_index(pronote, week_idx)
+                ensure_all_visible(pronote)
+                pronote.screenshot(path=f"{SCREEN_DIR}/08-week-{week_idx}.png", full_page=True)
 
-            entries: List[Dict[str, Any]] = []
-            for day in data.get("days", []):
-                date_txt = day["dateText"]  # ex "08/09" ou "08/09/2025"
-                for t in day["tiles"]:
-                    label = (t.get("label") or "").strip()
-                    ts = parse_timespan(label)
-                    if not ts:
-                        continue
-                    (h1,m1),(h2,m2) = ts
-                    start_dt = to_dt_from_date_and_hm(date_txt, (h1,m1))
-                    end_dt   = to_dt_from_date_and_hm(date_txt, (h2,m2))
-                    if not start_dt or not end_dt:
-                        continue
+                data = extract_week_items_with_dates(pronote)
+                hdr  = (data.get("header") or "").replace("\n"," ")[:160]
+                nb   = sum(len(d["tiles"]) for d in data.get("days", []))
+                log(f"Semaine {week_idx}: {nb} cours, header='{hdr}'")
 
-                    now = datetime.now()
-                    if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=120)):
-                        continue
+                # Log détaillé par jour
+                for d in data.get("days", []):
+                    sample = ", ".join([t["label"][:40] for t in d["tiles"][:3]])
+                    dbg(f"  - {d['dateText']} : {len(d['tiles'])} tuiles [{sample}]")
 
-                    title = f"{TITLE_PREFIX}{clean_summary(label)}"
-                    room  = extract_room(label)
+                entries: List[Dict[str, Any]] = []
+                for day in data.get("days", []):
+                    date_txt = day["dateText"]
+                    for t in day["tiles"]:
+                        label = (t.get("label") or "").strip()
+                        ts = parse_timespan(label)
+                        if not ts: 
+                            dbg(f"    skip (no timespan): {label[:80]}")
+                            continue
+                        (h1,m1),(h2,m2) = ts
+                        start_dt = to_dt_from_date_and_hm(date_txt, (h1,m1))
+                        end_dt   = to_dt_from_date_and_hm(date_txt, (h2,m2))
+                        if not start_dt or not end_dt:
+                            dbg(f"    skip (bad date): {date_txt} / {label[:80]}")
+                            continue
 
-                    entries.append({
-                        "title": title,
-                        "room": room,
-                        "start": start_dt,
-                        "end": end_dt,
-                        "date": start_dt.date(),
-                    })
+                        now = datetime.now()
+                        if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=120)):
+                            dbg(f"    skip (out of window): {start_dt} → {end_dt} / {label[:60]}")
+                            continue
 
-            entries = coalesce(entries)
+                        title = f"{TITLE_PREFIX}{clean_summary(label)}"
+                        room  = extract_room(label)
 
-            for e in entries:
-                h = make_hash_id(e["start"], e["end"], e["title"], e["room"])
-                body = {
-                    "summary": e["title"],
-                    "location": e["room"],
-                    "start": {"dateTime": e["start"].isoformat(), "timeZone": "Europe/Paris"},
-                    "end":   {"dateTime": e["end"].isoformat(),   "timeZone": "Europe/Paris"},
-                    "colorId": COLOR_ID,
-                    "extendedProperties": {"private": {"mo_hash": h, "source": "pronote_playwright"}},
-                }
-                try:
-                    action = upsert_event_by_hash(svc, CALENDAR_ID, h, body)
-                    if action == "created": created += 1
-                    else: updated += 1
-                except HttpError as e:
-                    print(f"[GCAL] {e}")
+                        entries.append({
+                            "title": title,
+                            "room": room,
+                            "start": start_dt,
+                            "end": end_dt,
+                            "date": start_dt.date(),
+                        })
+
+                dbg(f"  entries construits: {len(entries)}")
+                for e in entries[:3]:
+                    dbg(f"    ex: {e['title']} | {e['start']}→{e['end']} | {e['room']}")
+
+                # fusion des blocs contigus
+                entries = coalesce(entries)
+                dbg(f"  après fusion: {len(entries)}")
+
+                # dump CSV + envoi GCal
+                for e in entries:
+                    w.writerow([week_idx, e["date"].isoformat(), e["start"].isoformat(), e["end"].isoformat(), e["title"], e["room"]])
+
+                    h = make_hash_id(e["start"], e["end"], e["title"], e["room"])
+                    body = {
+                        "summary": e["title"],
+                        "location": e["room"],
+                        "start": {"dateTime": e["start"].isoformat(), "timeZone": "Europe/Paris"},
+                        "end":   {"dateTime": e["end"].isoformat(),   "timeZone": "Europe/Paris"},
+                        "colorId": COLOR_ID,
+                        "extendedProperties": {"private": {"mo_hash": h, "source": "pronote_playwright"}},
+                    }
+                    try:
+                        action = upsert_event_by_hash(svc, CALENDAR_ID, h, body)
+                        if action == "created": created += 1
+                        else: updated += 1
+                    except HttpError as ehttp:
+                        log(f"[GCAL] {ehttp}")
 
         browser.close()
 
-    print(f"Terminé. créés={created}, maj={updated}")
+    log(f"Terminé. créés={created}, maj={updated}")
 
 if __name__ == "__main__":
     try:
@@ -599,5 +623,5 @@ if __name__ == "__main__":
     try:
         run()
     except Exception as ex:
-        print(f"[FATAL] {ex}")
+        log(f"[FATAL] {ex}")
         sys.exit(1)
