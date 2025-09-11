@@ -67,20 +67,34 @@ def _norm(s: str) -> str:
     return s
 
 def make_event_id(start: datetime, end: datetime, title: str, location: str) -> str:
-    # id stable (évite les doublons)
+    # ID stable, compatible Google: uniquement a-v et 0-9
     key = f"{start.isoformat()}|{end.isoformat()}|{_norm(title)}|{_norm(location)}"
-    return "prn_" + hashlib.sha1(key.encode()).hexdigest()[:24]
+    return "prn" + hashlib.sha1(key.encode()).hexdigest()[:24]  # <-- plus de "_"
+
+
+from googleapiclient.errors import HttpError
 
 def upsert_event_by_id(svc, cal_id: str, event_id: str, body: Dict[str, Any]) -> str:
+    # Toujours mettre l'id dans le body (insert ne prend PAS eventId=)
+    body = dict(body)           # on copie pour ne pas modifier l'original
+    body["id"] = event_id
+
     try:
+        # Existe ? => patch
         svc.events().get(calendarId=cal_id, eventId=event_id).execute()
-        svc.events().patch(calendarId=cal_id, eventId=event_id, body=body, sendUpdates="none").execute()
+        svc.events().patch(
+            calendarId=cal_id, eventId=event_id, body=body, sendUpdates="none"
+        ).execute()
         return "updated"
     except HttpError as e:
+        # N'existe pas => insert (avec body["id"])
         if getattr(e, "resp", None) and e.resp.status == 404:
-            svc.events().insert(calendarId=cal_id, body=body, eventId=event_id, sendUpdates="none").execute()
+            svc.events().insert(
+                calendarId=cal_id, body=body, sendUpdates="none"
+            ).execute()
             return "created"
         raise
+
 
 # ========= Parsing helpers =========
 FR_MONTHS = {
