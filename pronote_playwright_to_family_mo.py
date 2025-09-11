@@ -348,28 +348,60 @@ def goto_timetable(pronote_page):
     pronote_page.set_default_timeout(TIMEOUT_MS)
     accept_cookies_any(pronote_page)
 
-    # perso : "Vie scolaire" -> "Emploi du temps"
-    if TIMETABLE_PRE_SELECTOR:
-        _click_css_in_frames(pronote_page, TIMETABLE_PRE_SELECTOR, TIMETABLE_FRAME, "pre-selector")
-    if TIMETABLE_SELECTOR:
-        if _click_css_in_frames(pronote_page, TIMETABLE_SELECTOR, TIMETABLE_FRAME, "timetable-selector"):
-            accept_cookies_any(pronote_page)
+    os.makedirs(SCREEN_DIR, exist_ok=True)
+
+    def frame_has_courses():
+        js = r'() => !!document.querySelector(\'div[id*="_coursInt_"][aria-label]\')'
+        for fr in pronote_page.frames:
             try:
-                fr2 = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
-                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-custom-selector.png", full_page=True)
-                return fr2
-            except TimeoutError:
+                if fr.evaluate(js):
+                    return fr
+            except:
                 pass
+        return None
 
-    # déjà sur EDT ?
-    try:
-        fr = wait_timetable_any_frame(pronote_page, timeout_ms=10_000)
+    # 0) Déjà sur l’EDT ?
+    fr0 = frame_has_courses()
+    if fr0:
         pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-already-here.png", full_page=True)
-        return fr
-    except TimeoutError:
-        pass
+        return fr0
 
-    # heuristiques
+    # 1) Ton chemin perso d’abord (SANS filtrer par frame)
+    clicked = False
+    if TIMETABLE_PRE_SELECTOR:
+        try:
+            for fr in pronote_page.frames:
+                loc = fr.locator(TIMETABLE_PRE_SELECTOR)
+                if loc.count() > 0:
+                    loc.first.click()
+                    clicked = True
+                    break
+            if clicked:
+                pronote_page.wait_for_timeout(WAIT_AFTER_NAV_MS)
+                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-clicked-pre-selector.png", full_page=True)
+        except Exception as e:
+            print(f"[NAV] PRE_SELECTOR error: {e}")
+
+    if TIMETABLE_SELECTOR:
+        try:
+            for fr in pronote_page.frames:
+                loc = fr.locator(TIMETABLE_SELECTOR)
+                if loc.count() > 0:
+                    loc.first.click()
+                    clicked = True
+                    break
+            if clicked:
+                pronote_page.wait_for_timeout(WAIT_AFTER_NAV_MS)
+                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-clicked-timetable-selector.png", full_page=True)
+        except Exception as e:
+            print(f"[NAV] TIMETABLE_SELECTOR error: {e}")
+
+    fr1 = frame_has_courses()
+    if fr1:
+        pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-from-selectors.png", full_page=True)
+        return fr1
+
+    # 2) Heuristiques (texte)
     attempts = [
         ["Emploi du temps", "Mon emploi du temps", "Emplois du temps"],
         ["Planning", "Agenda"],
@@ -379,16 +411,23 @@ def goto_timetable(pronote_page):
         for pat in pats:
             if click_text_anywhere(pronote_page, [pat]):
                 accept_cookies_any(pronote_page)
-                try:
-                    fr = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
-                    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-ready-{i}-{pat}.png", full_page=True)
-                    return fr
-                except TimeoutError:
-                    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-not-ready-{i}-{pat}.png", full_page=True)
+                pronote_page.wait_for_timeout(WAIT_AFTER_NAV_MS)
+                fr2 = frame_has_courses()
+                if fr2:
+                    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-heuristic-{i}-{pat}.png", full_page=True)
+                    return fr2
+                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-not-ready-{i}-{pat}.png", full_page=True)
         pronote_page.wait_for_timeout(600)
+
+    # 3) Dernière vérification
+    fr3 = frame_has_courses()
+    if fr3:
+        pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-fallback.png", full_page=True)
+        return fr3
 
     pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-NOT-found.png", full_page=True)
     raise RuntimeError("Impossible d’atteindre l’Emploi du temps.")
+
 
 def ensure_all_visible(page):
     if CLICK_TOUT_VOIR:
