@@ -32,11 +32,6 @@ jobs:
       WAIT_AFTER_NAV_MS: "1000"
       CLICK_TOUT_VOIR:  "1"
 
-         
-      # Petits timers confort
-      WAIT_AFTER_NAV_MS: '1000'   # pause après chaque clic critique
-      CLICK_TOUT_VOIR:   '1'      # clic auto sur “Tout voir”
-
     steps:
       - uses: actions/checkout@v4
 
