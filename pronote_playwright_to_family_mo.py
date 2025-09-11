@@ -1,5 +1,6 @@
+# -*- coding: utf-8 -*-
 # pronote_playwright_to_family_mo.py
-import os, sys, re, hashlib, unicodedata, time, json
+import os, sys, re, time, hashlib, unicodedata
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -11,42 +12,41 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # ========= CONFIG =========
-ENT_URL       = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
-PRONOTE_URL   = os.getenv("PRONOTE_URL", "")       # si vide, on clique la tuile PRONOTE depuis l’ENT
-ENT_USER      = os.getenv("PRONOTE_USER", "")
-ENT_PASS      = os.getenv("PRONOTE_PASS", "")
+ENT_URL     = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
+PRONOTE_URL = os.getenv("PRONOTE_URL", "")  # si vide, on clique la tuile PRONOTE depuis l’ENT
+ENT_USER    = os.getenv("PRONOTE_USER", "")
+ENT_PASS    = os.getenv("PRONOTE_PASS", "")
 
-# Sélecteurs personnalisés (tes CSS relevés dans tes captures)
-TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()  # ex: " #GInterface\\.Instances\\[0\\]\\.Instances\\[1\\]_Combo5 "
-TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()      # ex: " #GInterface\\.Instances\\[0\\]\\.Instances\\[1\\]_Liste_niveau5 > ul > li:nth-child(1) > div > div "
-TIMETABLE_FRAME_HINT   = os.getenv("TIMETABLE_FRAME", "").strip()         # indicatif d’URL de frame (facultatif)
+# Sélecteurs (facultatifs) — ceux que tu as fournis :
+TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()  # ex: "Vie scolaire"
+TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()      # ex: "Emploi du temps"
+TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()         # ex: "parent.html" (peut être vide)
 
-# Onglets semaine j_1, j_2, j_3...
-WEEK_TAB_TEMPLATE = os.getenv("WEEK_TAB_TEMPLATE", "").strip()            # ex: "#GInterface\\.Instances\\[2\\]\\.Instances\\[0\\]_j_{n}"
+# Onglets semaine (facultatif, si dispo) ex: "#GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}"
+WEEK_TAB_TEMPLATE = os.getenv("WEEK_TAB_TEMPLATE", "").strip()
+FETCH_WEEKS_FROM  = int(os.getenv("FETCH_WEEKS_FROM", "1"))  # semaine courante = 1
+WEEKS_TO_FETCH    = int(os.getenv("WEEKS_TO_FETCH", "4"))    # nb de semaines à parcourir
 
-FETCH_WEEKS_FROM  = int(os.getenv("FETCH_WEEKS_FROM", "1"))               # 1 = semaine affichée
-WEEKS_TO_FETCH    = int(os.getenv("WEEKS_TO_FETCH",   "4"))               # nombre d’onglets à parcourir
+WAIT_AFTER_NAV_MS = int(os.getenv("WAIT_AFTER_NAV_MS", "800"))
+CLICK_TOUT_VOIR   = os.getenv("CLICK_TOUT_VOIR", "1") == "1"
 
-WAIT_AFTER_NAV_MS = int(os.getenv("WAIT_AFTER_NAV_MS", "1000"))           # pause après clic
-CLICK_TOUT_VOIR   = os.getenv("CLICK_TOUT_VOIR", "1") == "1"              # cliquer “Tout voir”
-
-# Google Calendar
-CALENDAR_ID   = os.getenv("CALENDAR_ID", "family15066434840617961429@group.calendar.google.com")
-TITLE_PREFIX  = os.getenv("TITLE_PREFIX", "[Mo] ").strip()
-COLOR_ID      = os.getenv("COLOR_ID", "6")   # 6 = orange
-
-HEADFUL       = os.getenv("HEADFUL", "0") == "1"
+# Google
+CALENDAR_ID  = os.getenv("CALENDAR_ID", "family15066434840617961429@group.calendar.google.com")
+TITLE_PREFIX = os.getenv("TITLE_PREFIX", "[Mo] ")
+COLOR_ID     = os.getenv("COLOR_ID", "6")  # 6 = orange
 
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-# Timeouts (ms)
-TIMEOUT_MS  = 120_000
-SCREEN_DIR  = "screenshots"  # captures & dumps
+# Playwright
+HEADFUL    = os.getenv("HEADFUL", "0") == "1"
+TIMEOUT_MS = 120_000
+SCREEN_DIR = "screenshots"
 
-# ========= Google Calendar =========
+# ========= Utils/Google =========
 def get_gcal_service():
+    """OAuth client lourd (token.json régénéré si besoin)."""
     creds = None
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
@@ -65,17 +65,24 @@ def get_gcal_service():
             f.write(creds.to_json())
     svc = build("calendar", "v3", credentials=creds)
 
-    # Debug : s’assurer que le CALENDAR_ID existe bien côté Google
+    # Debug: vérifier que le CALENDAR_ID est bien accessible
     try:
-        lst = svc.calendarList().list().execute()
-        ids = [it.get("id") for it in lst.get("items", [])]
-        print(f"[DBG] CalendarList loaded: {len(ids)} calendars. CALENDAR_ID present? {CALENDAR_ID in ids}")
+        cl = svc.calendarList().list().execute()
+        items = cl.get("items", [])
+        present = any(c.get("id") == CALENDAR_ID for c in items)
+        print(f"[DBG] CalendarList loaded: {len(items)} calendars. CALENDAR_ID present? {present}")
     except Exception as e:
-        print(f"[DBG] CalendarList check failed: {e}")
+        print(f"[DBG] CalendarList error: {e}")
+
     return svc
 
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
 def make_hash_id(start: datetime, end: datetime, title: str, location: str) -> str:
-    base = f"{start.isoformat()}|{end.isoformat()}|{title}|{location}"
+    base = f"{start.isoformat()}|{end.isoformat()}|{_norm(title)}|{_norm(location)}"
     return hashlib.md5(base.encode("utf-8")).hexdigest()
 
 def find_event_by_hash(svc, cal_id: str, h: str):
@@ -90,7 +97,7 @@ def find_event_by_hash(svc, cal_id: str, h: str):
     return items[0] if items else None
 
 def upsert_event_by_hash(svc, cal_id: str, h: str, body: Dict[str, Any]) -> str:
-    # NB: on n’utilise pas eventId (invalide en insert), on s’appuie sur mo_hash
+    """Idempotent via extendedProperties.private.mo_hash, sans passer d'ID explicite (évite 400)."""
     existing = find_event_by_hash(svc, cal_id, h)
     if existing:
         ev_id = existing["id"]
@@ -101,39 +108,40 @@ def upsert_event_by_hash(svc, cal_id: str, h: str, body: Dict[str, Any]) -> str:
         return "created"
 
 # ========= Parsing =========
-HOUR_RE = re.compile(r'(?P<h>\d{1,2})[:hH](?P<m>\d{2})')
+HOUR_RE = re.compile(r'(?P<h>\d{1,2})\s*[:hH]\s*(?P<m>\d{2})')
 
 def parse_timespan(text: str) -> Optional[Tuple[Tuple[int,int], Tuple[int,int]]]:
     times = HOUR_RE.findall(text)
     if len(times) >= 2:
-        (h1,m1),(h2,m2) = times[0], times[1]
-        return (int(h1),int(m1)), (int(h2),int(m2))
+        (h1, m1), (h2, m2) = times[0], times[1]
+        return (int(h1), int(m1)), (int(h2), int(m2))
     return None
 
 def parse_aria_label(label: str) -> Dict[str, Any]:
     d = {"start": None, "end": None, "summary": None, "room": ""}
     lab = " ".join((label or "").split())
     tspan = parse_timespan(lab)
-    if tspan:
-        d["start"], d["end"] = tspan
+    if tspan: d["start"], d["end"] = tspan
 
     # Salle ...
     m_room = re.search(r'(?:Salle|Salles?)\s*([A-Za-z0-9\-_. ]+)', lab, re.IGNORECASE)
-    if m_room:
-        d["room"] = m_room.group(1).strip()
+    if m_room: d["room"] = m_room.group(1).strip()
 
-    # Résumé sans plages ni salle/prof
+    # Enlève entêtes horaires & salle/prof
     summary = lab
-    summary = re.sub(r'^\s*\d{1,2}[:hH]\d{2}\s*[–\-]\s*\d{1,2}[:hH]\d{2}\s*', '', summary)
+    summary = re.sub(r'^\s*\d{1,2}\s*[:hH]\s*\d{2}\s*[–\-à]\s*\d{1,2}\s*[:hH]\s*\d{2}\s*', '', summary)
     summary = re.sub(r'(Salle|Salles?).*$', '', summary, flags=re.IGNORECASE)
     summary = re.sub(r'(Prof\.?:.*)$', '', summary, flags=re.IGNORECASE)
     summary = summary.strip(" -–")
-    d["summary"] = summary if summary else "Cours"
+    if not summary: summary = "Cours"
+    d["summary"] = summary
     return d
 
-def monday_of_week(header_text: str) -> Optional[datetime]:
-    # Ex: "Semaine A, du 01/09/2025 au 05/09/2025" → 01/09/2025
-    m = re.search(r'du\s+(\d{1,2}/\d{1,2}/\d{4})\s+au\s+(\d{1,2}/\d{1,2}/\d{4})', header_text or "", re.IGNORECASE)
+def monday_of_week_from_header(text_header: str) -> Optional[datetime]:
+    if not text_header:
+        return None
+    # "Semaine A, du 01/09/2025 au 05/09/2025" ou "du 08/09/2025 au 12/09/2025"
+    m = re.search(r'(\d{2}/\d{2}/\d{4}).*?(\d{2}/\d{2}/\d{4})', text_header)
     if m:
         try:
             return datetime.strptime(m.group(1), "%d/%m/%Y")
@@ -148,31 +156,12 @@ def to_datetime(base_monday: Optional[datetime], day_idx: Optional[int], hm: tup
         base = datetime.now()
     return base.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
 
-def merge_ranges_by_title_room(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Fusionne les cours consécutifs strictement contigus (même résumé, même salle).
-    entries: liste de dicts {"start": dt, "end": dt, "title": str, "room": str}
-    """
-    entries = sorted(entries, key=lambda x: (x["title"], x["room"], x["start"]))
-    out = []
-    for e in entries:
-        if not out:
-            out.append(e)
-            continue
-        last = out[-1]
-        if (last["title"] == e["title"] and last["room"] == e["room"] and last["end"] == e["start"]):
-            # étendre
-            last["end"] = e["end"]
-        else:
-            out.append(e)
-    return out
-
 # ========= Playwright helpers =========
 def first_locator_in_frames(page, selectors: List[str]):
-    for fr in page.frames:
+    for frame in page.frames:
         for sel in selectors:
+            loc = frame.locator(sel)
             try:
-                loc = fr.locator(sel)
                 if loc.count() > 0:
                     return loc.first
             except:
@@ -197,57 +186,119 @@ def accept_cookies_any(page):
     sels = [f'button:has-text("{t}")' for t in texts] + [f'role=button[name="{t}"]' for t in texts]
     click_first_in_frames(page, sels)
 
-def dump_frames(pronote_page, tag: str):
-    """Dump HTML de chaque frame + capture plein écran."""
-    os.makedirs(SCREEN_DIR, exist_ok=True)
+def _frame_has_timetable_js():
+    # Détection permissive de l'EDT
+    return r"""
+      () => {
+        const txt = (document.body.innerText || '').replace(/\s+/g,' ');
+        const hasTitle = /Emploi du temps/i.test(txt) || /Planning|Agenda/i.test(txt);
+        const hasWeek  = /(Semaine|du\s+\d{1,2}\/\d{1,2}\/\d{4}\s+au\s+\d{1,2}\/\d{1,2}\/\d{4})/i.test(txt);
+        const hasTimes = /\d{1,2}\s*[h:]\s*\d{2}/i.test(txt);
+        return (hasTitle && (hasTimes || hasWeek)) || (hasWeek && hasTimes);
+      }
+    """
+
+def wait_timetable_any_frame(page, timeout_ms=120_000):
+    """Retourne le frame qui contient l’EDT (ou lève un TimeoutError)."""
+    deadline = time.time() + timeout_ms/1000.0
+    js = _frame_has_timetable_js()
+    while time.time() < deadline:
+        for fr in page.frames:
+            try:
+                if fr.evaluate(js):
+                    return fr
+            except:
+                pass
+        page.wait_for_timeout(500)
+    raise TimeoutError("Timetable not found in any frame")
+
+def dump_frames(page, tag="frames"):
     try:
-        pronote_page.screenshot(path=f"{SCREEN_DIR}/08-{tag}-page.png", full_page=True)
+        with open(f"dom-{tag}.txt", "w", encoding="utf-8") as f:
+            for i, fr in enumerate(page.frames):
+                f.write(f"[{i}] url={fr.url}\n")
+        for i, fr in enumerate(page.frames):
+            try:
+                html = fr.content()
+                with open(f"dom-{tag}-{i}.html", "w", encoding="utf-8") as fh:
+                    fh.write(html)
+            except:
+                pass
     except:
         pass
-    for i, fr in enumerate(pronote_page.frames):
-        try:
-            html = fr.content()
-            with open(f"{SCREEN_DIR}/dom-{tag}-{i}.html", "w", encoding="utf-8") as f:
-                f.write(html)
-            print(f"[DBG] dump frame#{i} url={fr.url} -> dom-{tag}-{i}.html")
-        except Exception as e:
-            print(f"[DBG] dump frame#{i} failed: {e}")
 
-def find_css_in_any_frame(pronote_page, css: str, timeout_ms: int = 5000):
-    """Retourne (frame, locator) si le sélecteur apparaît dans un des frames."""
+def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot_tag: str = "") -> bool:
+    """Essaie d'abord AVEC filtre de frame (si fourni), puis SANS filtre (IDs volatils)."""
     if not css:
-        return (None, None)
-    deadline = time.time() + timeout_ms/1000
-    while time.time() < deadline:
-        for fr in pronote_page.frames:
-            if TIMETABLE_FRAME_HINT and TIMETABLE_FRAME_HINT not in fr.url:
-                # si hint fourni, on restreint
+        return False
+
+    def _try(filter_str: str) -> bool:
+        for fr in page.frames:
+            if filter_str and filter_str not in fr.url:
                 continue
             try:
                 loc = fr.locator(css)
                 if loc.count() > 0:
-                    try:
-                        loc.first.wait_for(state="visible", timeout=1000)
-                    except:
-                        pass
-                    return (fr, loc.first)
+                    loc.first.click()
+                    page.wait_for_timeout(WAIT_AFTER_NAV_MS)
+                    if screenshot_tag:
+                        try: page.screenshot(path=f"{SCREEN_DIR}/08-clicked-{screenshot_tag}.png", full_page=True)
+                        except: pass
+                    return True
+            except Exception as e:
+                print(f"[NAV] click_css_in_frames fail in {fr.url}: {e}")
+        return False
+
+    if frame_url_contains and _try(frame_url_contains):
+        return True
+    return _try("")
+
+def click_text_anywhere(page, patterns: List[str]) -> bool:
+    """Clique un élément cliquable dont le texte matche un pattern, dans n’importe quel frame."""
+    for frame in page.frames:
+        for pat in patterns:
+            # rôles accessibles
+            for loc in [
+                frame.get_by_role("link", name=re.compile(pat, re.I)),
+                frame.get_by_role("button", name=re.compile(pat, re.I)),
+            ]:
+                try:
+                    if loc.count() > 0:
+                        loc.first.click()
+                        frame.wait_for_timeout(WAIT_AFTER_NAV_MS)
+                        return True
+                except:
+                    pass
+            # fallback JS
+            try:
+                found = frame.evaluate(
+                    r"""
+                    (pat) => {
+                      const rx = new RegExp(pat, 'i');
+                      const nodes = Array.from(document.querySelectorAll('body *')).filter(
+                        e => (e.innerText || '').match(rx)
+                      );
+                      for (const n of nodes) {
+                        let p = n;
+                        while (p) {
+                          if (p.tagName === 'A' || p.tagName === 'BUTTON' || p.getAttribute('role') === 'button' || p.onclick) {
+                            p.click();
+                            return true;
+                          }
+                          p = p.parentElement;
+                        }
+                      }
+                      return false;
+                    }
+                    """,
+                    pat
+                )
+                if found:
+                    frame.wait_for_timeout(WAIT_AFTER_NAV_MS)
+                    return True
             except:
                 pass
-        pronote_page.wait_for_timeout(200)
-    return (None, None)
-
-def frame_with_courses(pronote_page):
-    """Détecte un frame qui contient des cases de cours (empreinte PRONOTE)."""
-    js = r'() => !!document.querySelector(\'div[id*="_coursInt_"][aria-label]\')'
-    for fr in pronote_page.frames:
-        try:
-            if TIMETABLE_FRAME_HINT and TIMETABLE_FRAME_HINT not in fr.url:
-                continue
-            if fr.evaluate(js):
-                return fr
-        except:
-            pass
-    return None
+    return False
 
 # ========= Navigation =========
 def login_ent(page):
@@ -336,236 +387,159 @@ def open_pronote(context, page):
 def goto_timetable(pronote_page):
     pronote_page.set_default_timeout(TIMEOUT_MS)
     accept_cookies_any(pronote_page)
+    os.makedirs(SCREEN_DIR, exist_ok=True)
 
-    # 0) déjà sur EDT ?
-    fr = frame_with_courses(pronote_page)
-    if fr:
+    # Déjà sur l’EDT ?
+    try:
+        fr = wait_timetable_any_frame(pronote_page, timeout_ms=10_000)
         pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-already-here.png", full_page=True)
-        print("[NAV] EDT déjà détecté (cases de cours).")
         return fr
+    except Exception:
+        pass
 
-    dump_frames(pronote_page, "before-edt")
+    dump_frames(pronote_page, tag="before-edt")
 
-    # 1) Pré-sélecteur puis sélecteur EDT (dans n'importe quel frame, éventuellement filtré par TIMETABLE_FRAME_HINT)
-    clicked = False
+    # Chemin CSS personnalisé (pré-menu puis item)
     if TIMETABLE_PRE_SELECTOR:
-        fr0, loc0 = find_css_in_any_frame(pronote_page, TIMETABLE_PRE_SELECTOR, timeout_ms=8000)
-        print(f"[NAV] PRE_SELECTOR present? {bool(loc0)}")
-        if loc0:
-            try:
-                fr0.evaluate("(e)=>e.scrollIntoView({block:'center'})", loc0)
-            except: pass
-            try:
-                loc0.click()
-                clicked = True
-                pronote_page.wait_for_timeout(WAIT_AFTER_NAV_MS)
-                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-clicked-pre-selector.png", full_page=True)
-            except Exception as e:
-                print(f"[NAV] PRE_SELECTOR click error: {e}")
+        click_css_in_frames(pronote_page, TIMETABLE_PRE_SELECTOR, TIMETABLE_FRAME, "pre-selector")
 
     if TIMETABLE_SELECTOR:
-        fr1, loc1 = find_css_in_any_frame(pronote_page, TIMETABLE_SELECTOR, timeout_ms=8000)
-        print(f"[NAV] TIMETABLE_SELECTOR present? {bool(loc1)}")
-        if loc1:
+        if click_css_in_frames(pronote_page, TIMETABLE_SELECTOR, TIMETABLE_FRAME, "timetable-selector"):
+            accept_cookies_any(pronote_page)
             try:
-                fr1.evaluate("(e)=>e.scrollIntoView({block:'center'})", loc1)
-            except: pass
-            try:
-                loc1.click()
-                clicked = True
-                pronote_page.wait_for_timeout(WAIT_AFTER_NAV_MS)
-                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-clicked-timetable-selector.png", full_page=True)
-            except Exception as e:
-                print(f"[NAV] TIMETABLE_SELECTOR click error: {e}")
+                fr2 = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
+                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-custom-selector.png", full_page=True)
+                return fr2
+            except Exception:
+                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-custom-timeout.png", full_page=True)
 
-    if clicked:
-        fr = frame_with_courses(pronote_page)
-        if fr:
-            pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-from-selectors.png", full_page=True)
-            print("[NAV] EDT détecté après sélecteurs persos.")
-            return fr
-        else:
-            print("[NAV] Après clics persos, pas encore de cases cours visibles…")
-
-    # 2) Heuristiques texte
-    attempts = [
-        ["Emploi du temps", "Mon emploi du temps", "Emplois du temps"],
-        ["Planning", "Agenda"],
-        ["Vie scolaire", "Emploi du temps"],
+    # Fallback texte robuste : « Vie scolaire » → « Emploi du temps »
+    steps = [
+        ["Vie scolaire"],
+        ["Emploi du temps", "Planning", "Agenda"],
     ]
-    for i, pats in enumerate(attempts, 1):
-        for pat in pats:
-            if click_text_anywhere(pronote_page, [pat]):
-                accept_cookies_any(pronote_page)
-                pronote_page.wait_for_timeout(WAIT_AFTER_NAV_MS)
-                fr = frame_with_courses(pronote_page)
-                if fr:
-                    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-heuristic-{i}-{pat}.png", full_page=True)
-                    print(f"[NAV] EDT détecté via heuristique '{pat}'.")
-                    return fr
-                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-not-ready-{i}-{pat}.png", full_page=True)
-        pronote_page.wait_for_timeout(600)
+    for i, pats in enumerate(steps, 1):
+        if click_text_anywhere(pronote_page, pats):
+            accept_cookies_any(pronote_page)
+            try:
+                fr = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
+                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-ready-{i}.png", full_page=True)
+                return fr
+            except Exception:
+                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-not-ready-{i}.png", full_page=True)
+        pronote_page.wait_for_timeout(700)
 
-    # 3) Dernier check + dumps
-    fr = frame_with_courses(pronote_page)
-    if fr:
-        pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-fallback.png", full_page=True)
-        print("[NAV] EDT détecté en dernier recours.")
-        return fr
-
-    dump_frames(pronote_page, "edt-NOT-found")
-    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-NOT-found.png", full_page=True)
+    dump_frames(pronote_page, tag="after-tries")
     raise RuntimeError("Impossible d’atteindre l’Emploi du temps.")
 
 def ensure_all_visible(page):
     if CLICK_TOUT_VOIR:
-        # variantes possibles : “Tout voir”, “Voir tout”, …
         click_text_anywhere(page, ["Tout voir", "Voir tout", "Tout afficher"])
         page.wait_for_timeout(400)
 
-def click_text_anywhere(page, patterns: List[str]) -> bool:
-    """Clique un élément cliquable dont le texte matche un pattern, dans n’importe quel frame."""
-    for fr in page.frames:
-        for pat in patterns:
-            # 1) rôles accessibles
-            for loc in [
-                fr.get_by_role("link", name=re.compile(pat, re.I)),
-                fr.get_by_role("button", name=re.compile(pat, re.I)),
-            ]:
-                try:
-                    if loc.count() > 0:
-                        loc.first.click()
-                        return True
-                except:
-                    pass
-            # 2) fallback JS
-            try:
-                found = fr.evaluate(
-                    r"""
-                    (pat) => {
-                      const rx = new RegExp(pat, 'i');
-                      const nodes = Array.from(document.querySelectorAll('body *')).filter(
-                        e => (e.innerText || '').match(rx)
-                      );
-                      for (const n of nodes) {
-                        let p = n;
-                        while (p) {
-                          if (p.tagName === 'A' || p.tagName === 'BUTTON' || p.getAttribute('role') === 'button' || p.onclick) {
-                            p.click();
-                            return true;
-                          }
-                          p = p.parentElement;
-                        }
-                      }
-                      return false;
-                    }
-                    """,
-                    pat
-                )
-                if found:
-                    return True
-            except:
-                pass
-    return False
-
-def goto_week_by_index(pronote_page, n: int) -> bool:
+def goto_week_by_index(page, n: int) -> bool:
     """Clique l’onglet j_n si WEEK_TAB_TEMPLATE est fourni."""
     if not WEEK_TAB_TEMPLATE:
         return False
     css = WEEK_TAB_TEMPLATE.format(n=n)
-    fr, loc = find_css_in_any_frame(pronote_page, css, timeout_ms=5000)
-    if not loc:
-        print(f"[NAV] Onglet semaine '{css}' introuvable.")
-        return False
-    try:
-        fr.evaluate("(e)=>e.scrollIntoView({block:'center'})", loc)
-    except:
-        pass
-    try:
-        loc.click()
-        pronote_page.wait_for_timeout(WAIT_AFTER_NAV_MS)
-        # vérifier que l’EDT est encore là (il peut reloader)
-        if not frame_with_courses(pronote_page):
-            pronote_page.wait_for_timeout(600)
-        pronote_page.screenshot(path=f"{SCREEN_DIR}/09-week-tab-{n}.png", full_page=True)
-        return True
-    except Exception as e:
-        print(f"[NAV] click onglet semaine {n} error: {e}")
-        return False
+    ok = click_css_in_frames(page, css, TIMETABLE_FRAME, f"week-{n}")
+    if ok:
+        try:
+            wait_timetable_any_frame(page, timeout_ms=20_000)
+        except Exception:
+            pass
+    return ok
 
-# ========= Extraction =========
-def extract_week_info_from_frame(edt_frame) -> Dict[str, Any]:
-    """Lit header + tuiles DANS le frame de l’EDT UNIQUEMENT."""
+# ========= Extraction (sur le FRAME TIMETABLE !) =========
+def extract_week_info_from_frame(fr) -> Dict[str, Any]:
+    # Header semaine
     header_text = ""
     try:
-        # 1) essayer des éléments de header connus
-        for sel in ['.titrePeriode', '.zoneSemaines', 'header', 'legend', '[id*="Periode"]']:
-            try:
-                loc = edt_frame.locator(sel)
-                if loc.count() > 0:
-                    header_text = (loc.first.inner_text() or "").strip()
-                    if header_text:
-                        break
-            except:
-                pass
-        # 2) fallback via body innerText
-        if not header_text:
-            header_text = edt_frame.evaluate(
-                r"""() => (document.body.innerText || '').replace(/\s+/g,' ').trim()"""
-            )
-            # si trop verbeux, tenter d'extraire la partie "du xx/xx/xxxx au yy/yy/yyyy"
-            m = re.search(r'(Semaine[^,]*,\s*du\s*\d{1,2}/\d{1,2}/\d{4}\s*au\s*\d{1,2}/\d{1,2}/\d{4})', header_text or "", re.IGNORECASE)
-            if m:
-                header_text = m.group(1)
-            else:
-                header_text = (header_text or "")[:200]
-    except:
-        pass
-
-    # tiles dans le frame
-    tiles = []
-    try:
-        tiles = edt_frame.evaluate(r"""
-        () => {
-          const out = [];
-          const add = (el, label) => {
-            if (!label) return;
-            let dayIndex = null, p = el;
-            while (p) {
-              if (p.getAttribute && p.getAttribute('data-dayindex') != null) {
-                dayIndex = parseInt(p.getAttribute('data-dayindex')); break;
-              }
-              p = p.parentElement;
+        # On tente différents endroits courants
+        header_text = fr.evaluate(r"""
+          () => {
+            const picks = [
+              () => (document.querySelector('.zoneSemaines')||{}).innerText,
+              () => (document.querySelector('.titrePeriode')||{}).innerText,
+              () => (document.querySelector('header')||{}).innerText,
+            ];
+            for (const f of picks) {
+              try {
+                const t = (f()||'').trim();
+                if (t) return t;
+              } catch {}
             }
-            out.push({ label, dayIndex });
-          };
-          const rx = /\d{1,2}[:hH]\d{2}.*\d{1,2}[:hH]\d{2}/;
+            const txt = (document.body.innerText||'').trim();
+            return txt;
+          }
+        """) or ""
+    except:
+        header_text = ""
 
-          // PRONOTE: cases typiques
-          document.querySelectorAll('div[id*="_coursInt_"][aria-label]').forEach(e => {
-            const v = e.getAttribute('aria-label');
-            if (v && rx.test(v)) add(e, v);
-          });
+    # Cases (uniquement dans CE frame !)
+    tiles = fr.evaluate(r"""
+      () => {
+        const out = [];
+        const add = (el, label) => {
+          if (!label) return;
+          let dayIndex = null, p = el;
+          while (p) {
+            if (p.getAttribute && p.getAttribute('data-dayindex')) { dayIndex = parseInt(p.getAttribute('data-dayindex')); break; }
+            p = p.parentElement;
+          }
+          out.push({ label, dayIndex });
+        };
+        const rx = /\d{1,2}\s*[:hH]\s*\d{2}.*\d{1,2}\s*[:hH]\s*\d{2}/;
 
-          // fallback: attribut title
-          document.querySelectorAll('[title]').forEach(e => {
-            const v = e.getAttribute('title');
-            if (v && rx.test(v)) add(e, v);
-          });
+        document.querySelectorAll('[aria-label]').forEach(e => {
+          const v = e.getAttribute('aria-label'); if (v && rx.test(v)) add(e, v);
+        });
+        document.querySelectorAll('[title]').forEach(e => {
+          const v = e.getAttribute('title'); if (v && rx.test(v)) add(e, v);
+        });
 
-          // dernier recours: innerText (limité pour éviter bruit)
-          document.querySelectorAll('*').forEach(e => {
-            const t = (e.innerText || '').trim();
-            if (t && rx.test(t) && t.length < 180) add(e, t);
-          });
-          return out;
-        }
-        """)
-    except Exception as e:
-        print(f"[DBG] evaluate tiles error: {e}")
-        tiles = []
+        // texte court (évite d’attraper la page d’accueil « Aujourd'hui »)
+        document.querySelectorAll('[class*="Case"], [class*="Cours"], .edt *').forEach(e => {
+          const t = (e.innerText || '').trim();
+          if (t && t.length < 160 && rx.test(t)) add(e, t);
+        });
 
-    return {"monday": monday_of_week(header_text), "tiles": tiles or [], "header": header_text or ""}
+        return out;
+      }
+    """) or []
+
+    return {"header": header_text, "tiles": tiles}
+
+def merge_adjacent(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fusionne les demi-séances contiguës/chevauchantes (même jour, même matière+lieu)."""
+    if not entries:
+        return entries
+    # Clé de fusion
+    def k(e):
+        return (e["dayIndex"], _norm(e["summary"]), _norm(e["room"]))
+    # group by key
+    groups: Dict[Any, List[Dict[str, Any]]] = {}
+    for e in entries:
+        groups.setdefault(k(e), []).append(e)
+    merged: List[Dict[str, Any]] = []
+    for _, arr in groups.items():
+        arr.sort(key=lambda x: x["start_dt"])
+        cur = None
+        for e in arr:
+            if not cur:
+                cur = dict(e)
+                continue
+            # si overlap ou gap <= 10 min → fusion
+            gap = (e["start_dt"] - cur["end_dt"]).total_seconds() / 60.0
+            if gap <= 10:
+                if e["end_dt"] > cur["end_dt"]:
+                    cur["end_dt"] = e["end_dt"]
+            else:
+                merged.append(cur)
+                cur = dict(e)
+        if cur:
+            merged.append(cur)
+    return merged
 
 # ========= Main =========
 def run():
@@ -581,81 +555,96 @@ def run():
         page = context.new_page()
         page.set_default_timeout(TIMEOUT_MS)
 
-        # ENT → PRONOTE → EDT
+        # ENT → PRONOTE → Emploi du temps (frame)
         login_ent(page)
         pronote = open_pronote(context, page)
-        edt_frame = goto_timetable(pronote)  # frame où sont les cases
+        timetable_fr = goto_timetable(pronote)
+        ensure_all_visible(pronote)
 
-        # Parcours des semaines via onglets j_n (si fournis)
+        # Semaines à parcourir
         start_idx = max(1, FETCH_WEEKS_FROM)
         end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
         print(f"[CFG] Weeks: {start_idx}..{end_idx}")
 
         for week_idx in range(start_idx, end_idx + 1):
+            # Aller à l’onglet j_n si possible
             used_tab = goto_week_by_index(pronote, week_idx)
             accept_cookies_any(pronote)
             ensure_all_visible(pronote)
 
-            # retrouver le frame EDT (il peut recharger après le clic)
-            edt_frame = frame_with_courses(pronote) or edt_frame
-            info  = extract_week_info_from_frame(edt_frame)
-            d0    = info["monday"]
-            tiles = info["tiles"] or []
-            hdr   = (info.get("header") or "").replace("\n", " ")[:160]
+            # Re-récupérer le frame EDT après navigation
+            try:
+                timetable_fr = wait_timetable_any_frame(pronote, timeout_ms=30_000)
+            except Exception:
+                timetable_fr = None
 
-            # Construire des entrées brutes
-            raw_entries: List[Dict[str, Any]] = []
+            if not timetable_fr:
+                print(f"[WARN] Pas de frame EDT détecté pour la semaine {week_idx}.")
+                continue
+
+            info = extract_week_info_from_frame(timetable_fr)
+            hdr  = (info.get("header") or "").replace("\n", " ").strip()
+            tiles = info.get("tiles") or []
+
+            # Essaye de déduire le lundi depuis le header
+            monday = monday_of_week_from_header(hdr)
+
+            # Construire les entrées brutes
+            entries: List[Dict[str, Any]] = []
             for t in tiles:
                 label = (t.get("label") or "").strip()
+                if not label:
+                    continue
                 parsed = parse_aria_label(label)
                 if not parsed["start"] or not parsed["end"]:
                     continue
-                start_dt = to_datetime(d0, t.get("dayIndex"), parsed["start"])
-                end_dt   = to_datetime(d0, t.get("dayIndex"), parsed["end"])
-                raw_entries.append({
-                    "start": start_dt,
-                    "end":   end_dt,
-                    "title": (parsed["summary"] or "Cours").strip(),
-                    "room":  parsed["room"] or "",
+                start_dt = to_datetime(monday, t.get("dayIndex"), parsed["start"])
+                end_dt   = to_datetime(monday, t.get("dayIndex"), parsed["end"])
+                entries.append({
+                    "summary": parsed["summary"],
+                    "room": parsed.get("room", ""),
+                    "dayIndex": t.get("dayIndex"),
+                    "start_dt": start_dt,
+                    "end_dt": end_dt,
                 })
 
-            print(f"Semaine {week_idx}: {len(raw_entries)} cours, header='{hdr}'")
-            print(f"[DBG]   entries construits: {len(raw_entries)}")
+            print(f"Semaine {week_idx}: {len(entries)} cours, header='{hdr}'")
+            print(f"[DBG]   entries construits: {len(entries)}")
 
-            # Fusion des blocs contigus même titre/salle
-            merged = merge_ranges_by_title_room(raw_entries)
-            print(f"[DBG]   après fusion: {len(merged)}")
+            # Fusion demi-séances
+            entries = merge_adjacent(entries)
+            print(f"[DBG]   après fusion: {len(entries)}")
 
-            # Filtrer et pousser vers Google
+            # Filtrage fenêtre (pour éviter du bruit si header absent)
             now = datetime.now()
-            for e in merged:
-                # filtre fenêtre temporelle raisonnable
-                if e["end"] < (now - timedelta(days=60)) or e["start"] > (now + timedelta(days=180)):
+            kept = []
+            for e in entries:
+                if e["end_dt"] < (now - timedelta(days=30)):  # un peu large
                     continue
+                if e["start_dt"] > (now + timedelta(days=120)):
+                    continue
+                kept.append(e)
 
-                title = f"{TITLE_PREFIX}{e['title']}"
-                hash_id = make_hash_id(e["start"], e["end"], title, e["room"])
-                event = {
+            # Upsert vers Google
+            for e in kept:
+                title = f"{TITLE_PREFIX}{e['summary']}"
+                h = make_hash_id(e["start_dt"], e["end_dt"], title, e["room"])
+                body = {
                     "summary": title,
                     "location": e["room"],
-                    "start": {"dateTime": e["start"].isoformat(), "timeZone": "Europe/Paris"},
-                    "end":   {"dateTime": e["end"].isoformat(),   "timeZone": "Europe/Paris"},
+                    "start": {"dateTime": e["start_dt"].isoformat(), "timeZone": "Europe/Paris"},
+                    "end":   {"dateTime": e["end_dt"].isoformat(),   "timeZone": "Europe/Paris"},
                     "colorId": COLOR_ID,
-                    "extendedProperties": {"private": {"mo_hash": hash_id, "source": "pronote_playwright"}},
+                    "extendedProperties": {"private": {"mo_hash": h, "source": "pronote_playwright"}},
                 }
                 try:
-                    action = upsert_event_by_hash(svc, CALENDAR_ID, hash_id, event)
-                    if action == "created":
-                        created += 1
-                    else:
-                        updated += 1
-                except HttpError as ehttp:
-                    # Log lisible
-                    try:
-                        data = json.loads(ehttp.content.decode("utf-8"))
-                    except:
-                        data = str(ehttp)
-                    print(f"[GCAL] HttpError: {data}")
+                    action = upsert_event_by_hash(svc, CALENDAR_ID, h, body)
+                    if action == "created": created += 1
+                    else: updated += 1
+                except HttpError as e1:
+                    print(f"[GCAL] {e1}")
+                except Exception as e2:
+                    print(f"[GCAL] generic: {e2}")
 
         browser.close()
 
@@ -663,11 +652,12 @@ def run():
 
 if __name__ == "__main__":
     try:
+        os.makedirs(SCREEN_DIR, exist_ok=True)
+    except:
+        pass
+    try:
         run()
     except Exception as ex:
-        try:
-            os.makedirs(SCREEN_DIR, exist_ok=True)
-        except:
-            pass
         print(f"[FATAL] {ex}")
+        # Trace principale déjà en screenshots + dumps de frames si goto_timetable a échoué
         sys.exit(1)
