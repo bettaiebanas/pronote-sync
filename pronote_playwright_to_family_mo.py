@@ -405,12 +405,15 @@ def goto_week_by_index(page, n: int, frame=None) -> bool:
     return False
 
 def extract_week_info(frame) -> Dict[str, Any]:
+    """Extrait l’en-tête de semaine + toutes les tuiles de cours depuis la *frame* EDT.
+    Déduit le dayIndex depuis un ancêtre dont l'id correspond à ..._cours_<n>.
+    """
     header_text = ""
     for sel in ['text=/Semaine .* au .*/', '.titrePeriode', '.zoneSemaines', 'header']:
         try:
             loc = frame.locator(sel)
             if loc.count() > 0:
-                header_text = loc.first.inner_text()
+                header_text = (loc.first.inner_text() or "").strip()
                 if header_text:
                     break
         except:
@@ -421,31 +424,61 @@ def extract_week_info(frame) -> Dict[str, Any]:
     tiles = frame.evaluate(r"""
     () => {
       const out = [];
-      const add = (el, label) => {
-        if (!label) return;
-        let dayIndex = null, p = el;
+      const rxTime = /\d{1,2}\s*(?:[:hH]|heures?)\s*\d{2}\s*(?:-|–|à)\s*\d{1,2}\s*(?:[:hH]|heures?)\s*\d{2}/i;
+
+      const findDayIndex = (el) => {
+        let p = el;
         while (p) {
-          if (p.getAttribute && p.getAttribute('data-dayindex')) { dayIndex = parseInt(p.getAttribute('data-dayindex')); break; }
+          // cas PRONOTE: id ..._cours_<n>
+          if (p.id && /_cours_(\d+)/.test(p.id)) {
+            try { return parseInt(RegExp.$1, 10); } catch(e) {}
+          }
+          // fallback générique
+          if (p.getAttribute && p.getAttribute('data-dayindex')) {
+            try { return parseInt(p.getAttribute('data-dayindex'), 10); } catch(e) {}
+          }
           p = p.parentElement;
         }
-        out.push({ label, dayIndex });
+        return null;
       };
-      const rx = /\d{1,2}\s*(?:[:hH]|heures?)\s*\d{2}.*\d{1,2}\s*(?:[:hH]|heures?)\s*\d{2}/i;
-      document.querySelectorAll('[aria-label]').forEach(e => {
-        const v = e.getAttribute('aria-label'); if (v && rx.test(v)) add(e, v);
+
+      const add = (el, label) => {
+        if (!label) return;
+        const lab = String(label).trim();
+        if (!rxTime.test(lab)) return;
+        const dayIndex = findDayIndex(el);
+        out.push({ label: lab, dayIndex });
+      };
+
+      // 1) attributs explicites
+      document.querySelectorAll('[aria-label]').forEach(el => {
+        const v = el.getAttribute('aria-label');
+        if (v) add(el, v);
       });
-      document.querySelectorAll('[title]').forEach(e => {
-        const v = e.getAttribute('title'); if (v && rx.test(v)) add(e, v);
+      document.querySelectorAll('[title]').forEach(el => {
+        const v = el.getAttribute('title');
+        if (v) add(el, v);
       });
-      // en secours: petits blocs de texte courts contenant un intervalle horaire
-      document.querySelectorAll('*').forEach(e => {
-        const t = (e.innerText || '').trim();
-        if (t && t.length < 200 && rx.test(t)) add(e, t);
+
+      // 2) petits blocs de texte (sélecteurs fréquents sur l'EDT)
+      document.querySelectorAll('td[id*="_cont"], div.NoWrap, div[class*="EmploiDuTemps"]').forEach(el => {
+        const t = (el.innerText || '').trim();
+        if (t && t.length < 220 && rxTime.test(t)) add(el, t);
       });
-      return out;
+
+      // optionnel : dédoublonnage simple (texte + dayIndex)
+      const seen = new Set();
+      const dedup = [];
+      for (const it of out) {
+        const k = (it.dayIndex ?? 'x') + '|' + it.label;
+        if (!seen.has(k)) { seen.add(k); dedup.push(it); }
+      }
+      return dedup;
     }
     """)
+
     return {"monday": d0, "tiles": tiles, "header": header_text}
+
 
 def iter_next_week(page, frame) -> bool:
     # bouton "Semaine suivante"
@@ -504,11 +537,16 @@ def run():
                 if not label:
                     continue
                 parsed = parse_aria_label(label)
+                day_idx = t.get("dayIndex")
+                if day_idx is None:
+                   print(f"[SKIP] pas de dayIndex pour: {label[:80]}")
+
                 if not parsed["start"] or not parsed["end"]:
                     continue
 
-                start_dt = to_datetime(d0, t.get("dayIndex"), parsed["start"])
-                end_dt   = to_datetime(d0, t.get("dayIndex"), parsed["end"])
+            start_dt = to_datetime(d0, day_idx, parsed["start"])
+            end_dt   = to_datetime(d0, day_idx, parsed["end"])
+
                 if not start_dt or not end_dt:
                     continue
 
