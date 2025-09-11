@@ -14,23 +14,33 @@ jobs:
         shell: powershell
 
     env:
+      # Identifiants ENT (déjà dans tes secrets)
       PRONOTE_USER: ${{ secrets.PRONOTE_USER }}
       PRONOTE_PASS: ${{ secrets.PRONOTE_PASS }}
+
+      # Cible Google Calendar (laisse tel quel si c'est bien le calendrier Famille)
       CALENDAR_ID:  family15066434840617961429@group.calendar.google.com
+
+      # URLs ENT/PRONOTE (tes valeurs)
       ENT_URL:      https://ent77.seine-et-marne.fr/welcome
-      PRONOTE_URL:  "https://0771342r.index-education.net/pronote/parent.html"
+      PRONOTE_URL:  https://0771342r.index-education.net/pronote/parent.html
+
+      # Voir le navigateur (HEADFUL=1 sur self-hosted)
       HEADFUL:      "1"
-    
-      # Sélecteurs PRONOTE (tes valeurs qui marchaient)
-      TIMETABLE_PRE_SELECTOR: "#GInterface\\.Instances\\[0\\]\\.Instances\\[1\\]_Combo5"
-      TIMETABLE_SELECTOR:     "#GInterface\\.Instances\\[0\\]\\.Instances\\[1\\]_Liste_niveau5 > ul > li:nth-child(1) > div > div"
-      TIMETABLE_FRAME:        ""     # <= IMPORTANT: vide pour ne pas restreindre le frame
-    
-      WEEK_TAB_TEMPLATE: "#GInterface\\.Instances\\[2\\]\\.Instances\\[0\\]_j_{n}"
-      FETCH_WEEKS_FROM: "1"
-      WEEKS_TO_FETCH:   "4"
-      WAIT_AFTER_NAV_MS: "1000"
-      CLICK_TOUT_VOIR:  "1"
+
+      # Sélecteurs relevés sur ton instance PRONOTE
+      TIMETABLE_PRE_SELECTOR: '#GInterface\.Instances\[0\]\.Instances\[1\]_Combo5'
+      TIMETABLE_SELECTOR:     '#GInterface\.Instances\[0\]\.Instances\[1\]_Liste_niveau5 > ul > li:nth-child(1) > div > div'
+      TIMETABLE_FRAME:        'parent.html'
+
+      # Onglets semaines j_1, j_2, j_3…
+      WEEK_TAB_TEMPLATE: '#GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}'
+      FETCH_WEEKS_FROM: '1'
+      WEEKS_TO_FETCH:   '4'
+
+      # Divers
+      WAIT_AFTER_NAV_MS: '1000'
+      CLICK_TOUT_VOIR:   '1'
 
     steps:
       - uses: actions/checkout@v4
@@ -72,15 +82,19 @@ jobs:
         run: |
           & "$env:pythonLocation\python.exe" -m playwright install chromium
 
+      - name: Créer dossier screenshots
+        run: New-Item -ItemType Directory -Force -Path screenshots | Out-Null
+
       - name: Lancer la synchro Playwright -> Google Calendar
         run: |
-          New-Item -ItemType Directory -Force -Path screenshots | Out-Null
           & "$env:pythonLocation\python.exe" .\pronote_playwright_to_family_mo.py
 
-      - name: Upload screenshots
+      - name: Upload artefacts (captures + dumps DOM)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshots
-          path: screenshots/**
+          path: |
+            screenshots/**
+            dom-*.html
           if-no-files-found: ignore
