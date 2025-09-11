@@ -16,6 +16,10 @@ PRONOTE_URL   = os.getenv("PRONOTE_URL", "")       # si vide, on clique la tuile
 ENT_USER      = os.getenv("PRONOTE_USER", "")
 ENT_PASS      = os.getenv("PRONOTE_PASS", "")
 
+TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
+TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
+TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
+
 CALENDAR_ID   = os.getenv("CALENDAR_ID", "family15066434840617961429@group.calendar.google.com")
 TITLE_PREFIX  = "[Mo] "
 COLOR_ID      = "6"                                 # 6 = orange
@@ -302,9 +306,51 @@ def open_pronote(context, page):
     pronote_page.screenshot(path=f"{SCREEN_DIR}/07-pronote-home.png", full_page=True)
     return pronote_page
 
+def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot_tag: str = "") -> bool:
+    """
+    Clique le premier élément correspondant au sélecteur CSS dans n'importe quel frame.
+    Si frame_url_contains est non vide, ne clique que dans les frames dont l'URL contient cette sous-chaîne.
+    """
+    if not css:
+        return False
+    for fr in page.frames:
+        if frame_url_contains and frame_url_contains not in fr.url:
+            continue
+        try:
+            loc = fr.locator(css)
+            if loc.count() > 0:
+                loc.first.click()
+                if screenshot_tag:
+                    try: page.screenshot(path=f"{SCREEN_DIR}/08-clicked-{screenshot_tag}.png", full_page=True)
+                    except: pass
+                return True
+        except Exception as e:
+            print(f"[NAV] click_css_in_frames fail in {fr.url}: {e}")
+    return False
+
+
 def goto_timetable(pronote_page):
     pronote_page.set_default_timeout(TIMEOUT_MS)
     accept_cookies_any(pronote_page)
+        # 0) Si on a des sélecteurs “perso”, on s’en sert d’abord
+    #    0.1) Cliquer "Vie scolaire" (pré-selecteur) si fourni
+    if TIMETABLE_PRE_SELECTOR:
+        if click_css_in_frames(pronote_page, TIMETABLE_PRE_SELECTOR, TIMETABLE_FRAME, "pre-selector"):
+            accept_cookies_any(pronote_page)
+            pronote_page.wait_for_timeout(400)
+
+    #    0.2) Cliquer "Emploi du temps" (sélecteur principal) si fourni
+    if TIMETABLE_SELECTOR:
+        if click_css_in_frames(pronote_page, TIMETABLE_SELECTOR, TIMETABLE_FRAME, "timetable-selector"):
+            accept_cookies_any(pronote_page)
+            try:
+                fr2 = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
+                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-custom-selector.png", full_page=True)
+                return fr2
+            except TimeoutError:
+                pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-custom-timeout.png", full_page=True)
+                # on tombera sur les heuristiques plus bas
+
     os.makedirs(SCREEN_DIR, exist_ok=True)
 
     # 0) Déjà sur l’EDT ?
