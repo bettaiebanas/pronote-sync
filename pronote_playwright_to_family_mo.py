@@ -335,18 +335,32 @@ def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot
             print(f"[NAV] click_css_in_frames fail in {fr.url}: {e}")
     return False
 
+def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot_tag: str = "") -> bool:
+    if not css:
+        return False
+    for fr in page.frames:
+        if frame_url_contains and frame_url_contains not in fr.url:
+            continue
+        try:
+            loc = fr.locator(css)
+            if loc.count() > 0:
+                loc.first.click()
+                page.wait_for_timeout(WAIT_AFTER_NAV_MS)
+                if screenshot_tag:
+                    try: page.screenshot(path=f"{SCREEN_DIR}/08-clicked-{screenshot_tag}.png", full_page=True)
+                    except: pass
+                return True
+        except Exception as e:
+            print(f"[NAV] click_css_in_frames fail in {fr.url}: {e}")
+    return False
 
 def goto_timetable(pronote_page):
     pronote_page.set_default_timeout(TIMEOUT_MS)
     accept_cookies_any(pronote_page)
-        # 0) Si on a des sélecteurs “perso”, on s’en sert d’abord
-    #    0.1) Cliquer "Vie scolaire" (pré-selecteur) si fourni
+     # 0) Ton chemin “perso” : Vie scolaire -> Emploi du temps
     if TIMETABLE_PRE_SELECTOR:
-        if click_css_in_frames(pronote_page, TIMETABLE_PRE_SELECTOR, TIMETABLE_FRAME, "pre-selector"):
-            accept_cookies_any(pronote_page)
-            pronote_page.wait_for_timeout(400)
+        click_css_in_frames(pronote_page, TIMETABLE_PRE_SELECTOR, TIMETABLE_FRAME, "pre-selector")
 
-    #    0.2) Cliquer "Emploi du temps" (sélecteur principal) si fourni
     if TIMETABLE_SELECTOR:
         if click_css_in_frames(pronote_page, TIMETABLE_SELECTOR, TIMETABLE_FRAME, "timetable-selector"):
             accept_cookies_any(pronote_page)
@@ -356,7 +370,7 @@ def goto_timetable(pronote_page):
                 return fr2
             except TimeoutError:
                 pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-custom-timeout.png", full_page=True)
-                # on tombera sur les heuristiques plus bas
+                # on tombera sur les heuristiques existantes plus bas
 
     os.makedirs(SCREEN_DIR, exist_ok=True)
 
@@ -393,6 +407,24 @@ def goto_timetable(pronote_page):
     except TimeoutError:
         pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-NOT-found.png", full_page=True)
         raise RuntimeError("Impossible d’atteindre l’Emploi du temps (après multiples essais).")
+
+def ensure_all_visible(page):
+    if CLICK_TOUT_VOIR:
+        # plusieurs variantes possibles selon les instances PRONOTE
+        click_text_anywhere(page, ["Tout voir", "Voir tout", "Tout afficher"])
+        page.wait_for_timeout(400)
+
+def goto_week_by_index(page, n: int) -> bool:
+    if not WEEK_TAB_TEMPLATE:
+        return False
+    css = WEEK_TAB_TEMPLATE.format(n=n)
+    ok = click_css_in_frames(page, css, TIMETABLE_FRAME, f"week-{n}")
+    if ok:
+        try:
+            wait_timetable_any_frame(page, timeout_ms=20_000)
+        except TimeoutError:
+            pass
+    return ok
 
 def extract_week_info(pronote_page) -> Dict[str, Any]:
     header_text = ""
@@ -467,61 +499,62 @@ def run():
         goto_timetable(pronote)
 
         # Parcours n semaines
-        for w in range(WEEKS_TO_FETCH):
-            info = extract_week_info(pronote)
-            d0 = info["monday"]
-            tiles = info["tiles"] or []
-            print(f"Semaine {w+1}: {len(tiles)} cases, header='{(info.get('header') or '')[:80]}'")
+# --- Parcours des semaines via tes onglets j_n ---
+start_idx = max(1, FETCH_WEEKS_FROM)
+end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
 
-            for t in tiles:
-                label = (t.get("label") or "").strip()
-                if not label:
-                    continue
-                parsed = parse_aria_label(label)
-                if not parsed["start"] or not parsed["end"]:
-                    continue
+for week_idx in range(start_idx, end_idx + 1):
+    # Essaie d'aller directement sur j_1, j_2, j_3…
+    used_tab = goto_week_by_index(pronote, week_idx)
 
-                start_dt = to_datetime(d0, t.get("dayIndex"), parsed["start"])
-                end_dt   = to_datetime(d0, t.get("dayIndex"), parsed["end"])
+    accept_cookies_any(pronote)
+    ensure_all_visible(pronote)  # clique “Tout voir” si activé
 
-                now = datetime.now()
-                if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=90)):
-                    continue
+    info  = extract_week_info(pronote)
+    d0    = info["monday"]
+    tiles = info["tiles"] or []
+    hdr   = (info.get("header") or "").replace("\n", " ")[:120]
+    print(f"Semaine {week_idx}: {len(tiles)} cases, header='{hdr}'")
 
-                title = (parsed["summary"] or "Cours").strip()
-                title = f"{TITLE_PREFIX}{title}"
+    for t in tiles:
+        label = (t.get("label") or "").strip()
+        if not label:
+            continue
+        parsed = parse_aria_label(label)
+        if not parsed["start"] or not parsed["end"]:
+            continue
 
-                # id stable + propriétés étendues (pour debug)
-                event_id = make_event_id(start_dt, end_dt, title, parsed["room"])
-                mo_hash  = hashlib.md5(f"{start_dt}|{end_dt}|{title}|{parsed['room']}".encode()).hexdigest()
+        start_dt = to_datetime(d0, t.get("dayIndex"), parsed["start"])
+        end_dt   = to_datetime(d0, t.get("dayIndex"), parsed["end"])
 
-                event = {
-                    "summary": title,
-                    "location": parsed["room"],
-                    "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Paris"},
-                    "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "Europe/Paris"},
-                    "colorId": COLOR_ID,
-                    "extendedProperties": {
-                        "private": {
-                            "mo_hash": mo_hash,
-                            "source":  "pronote_playwright",
-                        }
-                    },
-                }
+        now = datetime.now()
+        if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=90)):
+            continue
 
-                try:
-                    action = upsert_event_by_id(svc, CALENDAR_ID, event_id, event)
-                    if action == "created": created += 1
-                    else: updated += 1
-                except HttpError as e:
-                    print(f"[GCAL] {e}")
+        title = f"{TITLE_PREFIX}{(parsed['summary'] or 'Cours').strip()}"
+        hash_id = make_hash_id(start_dt, end_dt, title, parsed["room"])
 
-            if w < WEEKS_TO_FETCH - 1 and not iter_next_week(pronote):
-                break
+        event = {
+            "summary": title,
+            "location": parsed["room"],
+            "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Paris"},
+            "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "Europe/Paris"},
+            "colorId": COLOR_ID,
+            "extendedProperties": {"private": {"mo_hash": hash_id, "source": "pronote_playwright"}},
+        }
 
-        browser.close()
+        try:
+            action = upsert_event_by_hash(svc, CALENDAR_ID, hash_id, event)
+            if action == "created": created += 1
+            else: updated += 1
+        except HttpError as e:
+            print(f"[GCAL] {e}")
 
-    print(f"Terminé. créés={created}, maj={updated}")
+    # Si on n'a pas pu cliquer j_n, on tente le bouton “semaine suivante” en fallback
+    if not used_tab and week_idx < end_idx:
+        if not iter_next_week(pronote):
+            break
+
 
 if __name__ == "__main__":
     try:
