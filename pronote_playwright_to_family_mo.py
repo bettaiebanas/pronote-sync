@@ -102,23 +102,35 @@ def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode()
     return re.sub(r"\s+"," ",s).strip().lower()
 
-def make_event_id(start: datetime, end: datetime, title: str, location: str) -> str:
+def make_dedupe_key(start: datetime, end: datetime, title: str, location: str) -> str:
     key = f"{start.isoformat()}|{end.isoformat()}|{_norm(title)}|{_norm(location)}"
-    return "prn_" + hashlib.sha1(key.encode()).hexdigest()[:24]
+    return hashlib.sha1(key.encode()).hexdigest()
 
-def upsert_event_by_id(svc, cal_id: str, event_id: str, body: Dict[str, Any]) -> str:
+def upsert_event_by_dedupe(svc, cal_id: str, body: Dict[str, Any], dedupe_key: str) -> str:
+    # Recherche par extendedProperties.private.dedupe
     try:
-        svc.events().get(calendarId=cal_id, eventId=event_id).execute()
-        svc.events().patch(calendarId=cal_id, eventId=event_id, body=body, sendUpdates="none").execute()
-        return "updated"
+        existing = svc.events().list(
+            calendarId=cal_id,
+            privateExtendedProperty=f"dedupe={dedupe_key}",
+            timeMin=body["start"]["dateTime"],
+            timeMax=(datetime.fromisoformat(body["end"]["dateTime"])+timedelta(minutes=1)).isoformat(),
+            maxResults=2,
+            singleEvents=True,
+            showDeleted=False
+        ).execute()
+        items = existing.get("items", [])
     except HttpError as e:
-        if getattr(getattr(e,"resp",None),"status",None) == 404:
-            body2 = dict(body); body2["id"] = event_id
-            svc.events().insert(calendarId=cal_id, body=body2, sendUpdates="none").execute()
-            return "created"
-        raise
+        items = []
 
-# ===================== Parsing =====================
+    if items:
+        ev_id = items[0]["id"]
+        svc.events().patch(calendarId=cal_id, eventId=ev_id, body=body, sendUpdates="none").execute()
+        return "updated"
+    else:
+        svc.events().insert(calendarId=cal_id, body=body, sendUpdates="none").execute()
+        return "created"
+
+# ===================== Parsing (identique) =====================
 H_PATTERNS = [
     re.compile(r'(?P<h>\d{1,2})\s*[hH:]\s*(?P<m>\d{2})'),
     re.compile(r'(?P<h>\d{1,2})\s*(?:heures?|hrs?)\s*(?P<m>\d{2})', re.IGNORECASE)
@@ -126,23 +138,15 @@ H_PATTERNS = [
 DURATION_RE = re.compile(r'(?P<dh>\d{1,2})\s*[hH]\s*(?P<dm>\d{2})')
 
 def parse_times(text: str) -> Dict[str, Optional[tuple[int,int]]]:
-    """Supporte: 
-    - '08h05 - 09h00'  -> start/end
-    - 'de 8 heures 05 à 9 heures 00' -> start/end
-    - '1h00 - vendredi 26/09 à 11h15' -> durée + début
-    """
     t = (text or "").strip()
     hours: List[tuple[int,int]] = []
     for rx in H_PATTERNS:
         for m in rx.finditer(t):
             hours.append((int(m.group("h")), int(m.group("m"))))
-
     if 'à' in t and re.search(r'\d{1,2}\s*/\s*\d{1,2}(?:\s*/\s*\d{2,4})?', t) and len(hours) == 2:
         return {"start": hours[1], "end": None, "duration": hours[0]}
-
     if len(hours) >= 2:
         return {"start": hours[0], "end": hours[1], "duration": None}
-
     dm = DURATION_RE.search(t)
     if dm and hours:
         return {"start": hours[-1], "end": None, "duration": (int(dm.group("dh")), int(dm.group("dm")))}
@@ -176,19 +180,14 @@ def parse_panel(panel: Dict[str, Any], year: int) -> Optional[Dict[str, Any]]:
     matiere = re.sub(r'\s+', ' ', (panel.get("matiere","") or "").strip())
     salle   = re.sub(r'\s+', ' ', (panel.get("salle","") or "").strip())
     times = parse_times(header)
-    if not (times["start"] or times["end"]):
-        return None
+    if not (times["start"] or times["end"]): return None
     dt_date = parse_date_from_text(header, fallback_year=year)
-    if not dt_date:
-        return None
+    if not dt_date: return None
     start_hm = times["start"]; end_hm = times["end"]
     if start_hm and end_hm:
-        start_dt = to_dt(dt_date, start_hm)
-        end_dt   = to_dt(dt_date, end_hm)
+        start_dt = to_dt(dt_date, start_hm); end_dt = to_dt(dt_date, end_hm)
     elif start_hm and times["duration"]:
-        dh, dm = times["duration"]
-        start_dt = to_dt(dt_date, start_hm)
-        end_dt   = start_dt + timedelta(hours=dh, minutes=dm)
+        dh, dm = times["duration"]; start_dt = to_dt(dt_date, start_hm); end_dt = start_dt + timedelta(hours=dh, minutes=dm)
     else:
         return None
     summary = matiere or "Cours"
@@ -197,7 +196,7 @@ def parse_panel(panel: Dict[str, Any], year: int) -> Optional[Dict[str, Any]]:
         if m: salle = m.group(1).strip()
     return {"summary": summary, "room": salle, "start_dt": start_dt, "end_dt": end_dt}
 
-# ===================== Playwright helpers =====================
+# ===================== Playwright helpers (inchangés vs dernière version) =====================
 def _iter_contexts(page: Page):
     yield page
     for fr in page.frames: yield fr
@@ -241,10 +240,8 @@ def _frame_has_timetable_js() -> str:
     """
 
 def find_timetable_ctx(page: Page, timeout_ms: int = TIMEOUT_MS) -> Union[Page, Frame]:
-    """Choisit le bon frame: d'abord via TIMETABLE_FRAME, sinon via heuristique contenu."""
     deadline = time.time() + timeout_ms/1000.0
     while time.time() < deadline:
-        # 1) Préférence explicite
         if TIMETABLE_FRAME:
             for fr in page.frames:
                 try:
@@ -253,14 +250,12 @@ def find_timetable_ctx(page: Page, timeout_ms: int = TIMEOUT_MS) -> Union[Page, 
                             return fr
                 except Exception: 
                     continue
-        # 2) Heuristique contenu
         for fr in page.frames:
             try:
                 if fr.evaluate(_frame_has_timetable_js()):
                     return fr
             except Exception: 
                 continue
-        # 3) Page elle-même
         try:
             if page.evaluate(_frame_has_timetable_js()):
                 return page
@@ -503,7 +498,6 @@ def _collect_pairs_by_proximity(ctx: Union[Page, Frame]) -> List[Dict[str, str]]
     }""")
 
 def _read_week_header(ctx: Union[Page, Frame]) -> str:
-    # Cherche 'du dd/mm[/yy|yyyy] au dd/mm[/yy|yyyy]' partout, y compris onglets
     try:
         return ctx.evaluate(r"""() => {
           const txt = (document.body.innerText || '').replace(/\s+/g,' ');
@@ -606,26 +600,20 @@ def extract_week_info(ctx: Union[Page, Frame]) -> Dict[str, Any]:
             aria = t.get("aria","")
             cont = t.get("cont","")
             times = parse_times(aria)
-            if not (times["start"] or times["end"]):
-                continue
+            if not (times["start"] or times["end"]): continue
             dt_date = parse_date_from_text(aria, fallback_year=year)
             if not dt_date and monday:
                 text_l = (aria or '').lower()
                 jours = ['lundi','mardi','mercredi','jeudi','vendredi','samedi','dimanche']
                 found = next((i for i,n in enumerate(jours) if n in text_l), None)
-                if found is not None:
-                    dt_date = monday + timedelta(days=found)
-            if not dt_date:
-                continue
+                if found is not None: dt_date = monday + timedelta(days=found)
+            if not dt_date: continue
 
             start_hm = times["start"]; end_hm = times["end"]
             if start_hm and end_hm:
-                start_dt = to_dt(dt_date, start_hm)
-                end_dt   = to_dt(dt_date, end_hm)
+                start_dt = to_dt(dt_date, start_hm); end_dt = to_dt(dt_date, end_hm)
             elif start_hm and times["duration"]:
-                dh, dm = times["duration"]
-                start_dt = to_dt(dt_date, start_hm)
-                end_dt   = start_dt + timedelta(hours=dh, minutes=dm)
+                dh, dm = times["duration"]; start_dt = to_dt(dt_date, start_hm); end_dt = start_dt + timedelta(hours=dh, minutes=dm)
             else:
                 continue
             summary = (re.sub(r'\s+',' ', cont).strip() or "Cours")
@@ -702,17 +690,17 @@ def run() -> None:
                     continue
 
                 title    = f"{TITLE_PREFIX}{summary}"
-                event_id = make_event_id(start_dt, end_dt, title, room)
+                dedupe   = make_dedupe_key(start_dt, end_dt, title, room)
                 body = {
                     "summary": title,
                     "location": room,
                     "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
                     "end":   {"dateTime": end_dt.isoformat(),   "timeZone": TIMEZONE},
                     "colorId": COLOR_ID,
-                    "extendedProperties": {"private": {"source": "pronote_playwright"}}
+                    "extendedProperties": {"private": {"source": "pronote_playwright", "dedupe": dedupe}}
                 }
                 try:
-                    action = upsert_event_by_id(svc, CALENDAR_ID, event_id, body)
+                    action = upsert_event_by_dedupe(svc, CALENDAR_ID, body, dedupe)
                     if action == "created": created += 1
                     else: updated += 1
                 except HttpError as e:
