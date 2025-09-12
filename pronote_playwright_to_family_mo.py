@@ -36,9 +36,10 @@ WAIT_AFTER_NAV_MS      = int(os.getenv("WAIT_AFTER_NAV_MS", "1000"))
 
 # Bornes anti-hang
 MAX_TILES_PER_WEEK     = int(os.getenv("MAX_TILES_PER_WEEK", "120"))
-MAX_CLICK_PER_SELECTOR = int(os.getenv("MAX_CLICK_PER_SELECTOR", "100"))
+MAX_CLICK_PER_SELECTOR = int(os.getenv("MAX_CLICK_PER_SELECTOR", "120"))
 WEEK_HARD_TIMEOUT_MS   = int(os.getenv("WEEK_HARD_TIMEOUT_MS", "120000"))
 PANEL_WAIT_MS          = int(os.getenv("PANEL_WAIT_MS", "350"))
+PANEL_RETRIES          = int(os.getenv("PANEL_RETRIES", "8"))  # ~2.8s par clic
 
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
@@ -126,15 +127,13 @@ H_PATTERNS = [
 DURATION_RE = re.compile(r'(?P<dh>\\d{1,2})\\s*[hH]\\s*(?P<dm>\\d{2})')
 
 def parse_times(text: str) -> Dict[str, Optional[tuple[int,int]]]:
-    """Supporte: '08h05 - 09h00' OU '1h00 - lundi 08/09 à 08h05'"""
-    # Cherche deux heures (plage)
+    """Supporte: '08h05 - 09h00' OU '1h00 - vendredi 26/09 à 08h05'"""
     hours: List[tuple[int,int]] = []
     for rx in H_PATTERNS:
         for m in rx.finditer(text or ""):
             hours.append((int(m.group("h")), int(m.group("m"))))
     if len(hours) >= 2:
         return {"start": hours[0], "end": hours[1], "duration": None}
-    # Cherche durée + heure de début
     dm = DURATION_RE.search(text or "")
     if dm and hours:
         return {"start": hours[-1], "end": None, "duration": (int(dm.group("dh")), int(dm.group("dm")))}
@@ -164,23 +163,15 @@ def to_dt(date_base: datetime, hm: tuple[int,int]) -> datetime:
 
 def parse_panel(panel: Dict[str, Any], year: int) -> Optional[Dict[str, Any]]:
     header = panel.get("header","")
-    matiere = (panel.get("matiere","") or "").strip()
-    matiere = re.sub(r'\\s+', ' ', matiere).strip()
-    # Garde seulement la 1ère ligne lisible (si multiples items)
-    if ' ' in matiere:
-        # souvent le texte est "PHYSIQUE-CHIMIE  ..." -> on garde jusqu'au 1er double espace
-        pass
-    salle = (panel.get("salle","") or "").strip()
-    salle = re.sub(r'\\s+', ' ', salle).strip()
-    # Parsing heures
+    matiere = re.sub(r'\\s+', ' ', (panel.get("matiere","") or "").strip())
+    salle   = re.sub(r'\\s+', ' ', (panel.get("salle","") or "").strip())
     times = parse_times(header)  # peut retourner durée
     if not (times["start"] or times["end"]):
         return None
     dt_date = parse_date_from_text(header, fallback_year=year)
     if not dt_date:
         return None
-    start_hm = times["start"]
-    end_hm = times["end"]
+    start_hm = times["start"]; end_hm = times["end"]
     if start_hm and end_hm:
         start_dt = to_dt(dt_date, start_hm)
         end_dt   = to_dt(dt_date, end_hm)
@@ -190,9 +181,7 @@ def parse_panel(panel: Dict[str, Any], year: int) -> Optional[Dict[str, Any]]:
         end_dt   = start_dt + timedelta(hours=dh, minutes=dm)
     else:
         return None
-    # Titre cours
     summary = matiere or "Cours"
-    # Salle: récupère le dernier token typé salle si vide
     if not salle:
         m = re.search(r'(?:Salle[s]?\\s+)(.+)$', header, re.IGNORECASE)
         if m: salle = m.group(1).strip()
@@ -234,7 +223,7 @@ def _frame_has_timetable_js() -> str:
       () => {
         const txt = (document.body.innerText || '').replace(/\s+/g,' ');
         const hasTitle = /Emploi du temps/i.test(txt) || /Planning|Agenda/i.test(txt);
-        const hasWeek  = /(Semaine|du\s+\d{1,2}\/\d{1,2}\/\d{4}\s+au\s+\d{1,2}\/\d{1,2}\/\d{4})/i.test(txt);
+        const hasWeek  = /(Semaine|du\s+\d{1,2}\/\d{1,2}\/\d{4})/i.test(txt);
         const hasTimes = /\d{1,2}\s*[h:]\s*\d{2}|heures?\s*\d{2}/i.test(txt);
         return (hasTitle && (hasTimes || hasWeek)) || (hasWeek && hasTimes);
       }
@@ -277,7 +266,7 @@ def click_css_any(page, css: str, screenshot_tag: str = "") -> bool:
 def login_ent(page) -> None:
     _safe_mkdir(SCREEN_DIR)
     page.set_default_timeout(TIMEOUT_MS)
-    page.goto(ENT_URL, wait_until="load")
+    page.goto(ENT_URL, wait_until("load"))
     page.wait_for_load_state("domcontentloaded")
     accept_cookies_any(page)
     _safe_shot(page, "01-ent-welcome")
@@ -420,18 +409,48 @@ def _click_candidate(ctx, sel: str, idx: int) -> bool:
     }""", {"sel": sel, "i": idx})
 
 def _read_visible_panel(ctx) -> Optional[Dict[str, Any]]:
+    for _ in range(PANEL_RETRIES):
+        panel = ctx.evaluate(r"""() => {
+          const vis = e => e && getComputedStyle(e).display!=='none' && e.offsetParent!==null;
+          const panels = Array.from(document.querySelectorAll('.ConteneurCours')).filter(vis);
+          if (!panels.length) return null;
+          const p = panels[panels.length-1];
+          const header = (p.querySelector('.EnteteCoursLibelle')?.innerText||'').replace(/\s+/g,' ').trim();
+          if (!header) return null;
+          const groups = Array.from(p.querySelectorAll('[role="group"]'));
+          const pick = (name) => {
+            const g = groups.find(x => (x.getAttribute('aria-label')||'').toLowerCase().includes(name));
+            return g ? (g.innerText||'').replace(/\s+/g,' ').trim() : '';
+          };
+          return { header, matiere: pick('matière') || pick('matiere'), salle: pick('salles') || pick('salle') };
+        }""")
+        if panel: return panel
+        time.sleep(PANEL_WAIT_MS/1000.0)
+    return None
+
+def _collect_pairs_by_proximity(ctx) -> List[Dict[str, str]]:
     return ctx.evaluate(r"""() => {
-      const vis = e => e && getComputedStyle(e).display!=='none' && e.offsetParent!==null;
-      const panels = Array.from(document.querySelectorAll('.ConteneurCours')).filter(vis);
-      if (!panels.length) return null;
-      const p = panels[panels.length-1];
-      const header = (p.querySelector('.EnteteCoursLibelle')?.innerText||'').replace(/\s+/g,' ').trim();
-      const groups = Array.from(p.querySelectorAll('[role="group"]'));
-      const pick = (name) => {
-        const g = groups.find(x => (x.getAttribute('aria-label')||'').toLowerCase().includes(name));
-        return g ? (g.innerText||'').replace(/\s+/g,' ').trim() : '';
-      };
-      return { header, matiere: pick('matière') || pick('matiere'), salle: pick('salles') || pick('salle') };
+      const cours = Array.from(document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')).map(e=>({id:e.id, r:e.getBoundingClientRect()}));
+      const conts = Array.from(document.querySelectorAll('[id^="id_"][id*="_cont"]')).map(e=>({id:e.id, r:e.getBoundingClientRect(), text:(e.innerText||'').replace(/\s+/g,' ').trim()}));
+      const byBase = (s) => (s.match(/^id_(\d+)_/)||[])[1]||'';
+      const groupCont = {};
+      for (const c of conts) {
+        const b = byBase(c.id);
+        (groupCont[b] = groupCont[b] || []).push(c);
+      }
+      const out = [];
+      for (const cu of cours) {
+        const b = byBase(cu.id);
+        const list = (groupCont[b]||[]);
+        if (!list.length) { out.push({id:cu.id, aria:'', cont:''}); continue; }
+        let best = list[0], bestd = 1e12;
+        for (const x of list) {
+          const d = Math.abs((x.r.top + x.r.bottom)/2 - (cu.r.top + cu.r.bottom)/2);
+          if (d < bestd) { best=x; bestd=d; }
+        }
+        out.push({id:cu.id, aria:(document.getElementById(cu.id)?.getAttribute('aria-label')||''), cont: best.text});
+      }
+      return out;
     }""")
 
 def extract_week_info(pronote_page) -> Dict[str, Any]:
@@ -455,7 +474,6 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
     tiles: List[Dict[str, Any]] = []
     year = (monday.year if monday else datetime.now().year)
 
-    # Compte candidats pour transparence
     counts = {}
     for sel in CANDIDATE_SELECTORS:
         try:
@@ -465,16 +483,15 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         counts[sel] = int(c or 0)
     _safe_write(f"{SCREEN_DIR}/edp_selector_counts.json", json.dumps(counts, ensure_ascii=False, indent=2))
 
-    # Clique séquentiellement des candidats et lit le panneau
+    parsed_by_click = 0
     for sel in CANDIDATE_SELECTORS:
         n = counts.get(sel, 0)
         lim = min(n, MAX_CLICK_PER_SELECTOR, MAX_TILES_PER_WEEK - len(tiles))
         for i in range(lim):
             if not _click_candidate(ctx, sel, i):
                 continue
-            time.sleep(PANEL_WAIT_MS/1000.0)
             panel = _read_visible_panel(ctx)
-            if not panel or not (panel.get("header") or panel.get("matiere")):
+            if not panel:
                 continue
             parsed = parse_panel(panel, year)
             if not parsed:
@@ -486,13 +503,49 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
                 "start_dt": parsed["start_dt"],
                 "end_dt": parsed["end_dt"]
             })
-            # fermer (si nécessaire)
+            parsed_by_click += 1
             try: ctx.evaluate("()=>document.body.click()")
             except Exception: pass
             if len(tiles) >= MAX_TILES_PER_WEEK:
                 break
         if len(tiles) >= MAX_TILES_PER_WEEK:
             break
+
+    if not tiles:
+        pairs = _collect_pairs_by_proximity(ctx)
+        _safe_write(f"{SCREEN_DIR}/edp_pairs_preview.json", json.dumps(pairs[:10], ensure_ascii=False, indent=2))
+        for t in pairs:
+            aria = t.get("aria","")
+            cont = t.get("cont","")
+            times = parse_times(aria)
+            if not (times["start"] or times["end"]):
+                continue
+            dt_date = parse_date_from_text(aria, fallback_year=year) or monday
+            if not dt_date:
+                continue
+            start_hm = times["start"]; end_hm = times["end"]
+            if start_hm and end_hm:
+                start_dt = to_dt(dt_date, start_hm)
+                end_dt   = to_dt(dt_date, end_hm)
+            elif start_hm and times["duration"]:
+                dh, dm = times["duration"]
+                start_dt = to_dt(dt_date, start_hm)
+                end_dt   = start_dt + timedelta(hours=dh, minutes=dm)
+            else:
+                continue
+            summary = (re.sub(r'\\s+',' ', cont).strip() or "Cours")
+            room = ""
+            m = re.search(r'(?:Salle[s]?\\s+)(.+)$', cont, re.IGNORECASE)
+            if m: room = m.group(1).strip()
+            tiles.append({
+                "label": f"{summary} — {aria}",
+                "summary": summary,
+                "room": room,
+                "start_dt": start_dt,
+                "end_dt": end_dt
+            })
+            if len(tiles) >= MAX_TILES_PER_WEEK:
+                break
 
     if not tiles:
         try: html_full = ctx.evaluate("() => document.documentElement.outerHTML")
@@ -504,6 +557,11 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
           entetes: Array.from(document.querySelectorAll('.EnteteCoursLibelle')).map(e=>e.innerText.trim()).slice(0,50)
         })""")
         _safe_write(f"{SCREEN_DIR}/edp_candidates.json", json.dumps(ids_dump, ensure_ascii=False, indent=2))
+
+    _safe_write(f"{SCREEN_DIR}/edp_debug_summary.json", json.dumps({
+        "header": header_text, "monday": monday.isoformat() if monday else None,
+        "found_by_click": parsed_by_click, "total_tiles": len(tiles)
+    }, ensure_ascii=False, indent=2))
 
     return {"monday": monday, "tiles": tiles, "header": header_text}
 
