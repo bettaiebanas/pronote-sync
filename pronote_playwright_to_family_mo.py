@@ -466,7 +466,8 @@ COURSE_CANDIDATE_SELECTORS = [
 
 def _eval_candidates(ctx):
     return ctx.evaluate(r"""
-      (sels, limit) => {
+      (p) => {
+        const sels = p.sels, limit = p.limit;
         const uniq = new Set(), out = [];
         for (const sel of sels) {
           const els = Array.from(document.querySelectorAll(sel)).slice(0, limit);
@@ -485,7 +486,7 @@ def _eval_candidates(ctx):
         }
         return out;
       }
-    """, COURSE_CANDIDATE_SELECTORS, MAX_CLICK_PER_SELECTOR)
+    """, {"sels": COURSE_CANDIDATE_SELECTORS, "limit": MAX_CLICK_PER_SELECTOR})
 
 def _visible_tooltips(ctx):
     return ctx.evaluate(r"""
@@ -501,7 +502,7 @@ def _visible_tooltips(ctx):
 
 def _click_nth(ctx, sel: str, idx: int) -> bool:
     try:
-        return ctx.evaluate("""(sel,i)=>{ const els = Array.from(document.querySelectorAll(sel)); if(!els[i]) return false; els[i].click(); return true;}""", sel, idx)
+        return ctx.evaluate("""(p)=>{ const sel=p.sel, i=p.i; const els = Array.from(document.querySelectorAll(sel)); if(!els[i]) return false; els[i].click(); return true;}""", {"sel": sel, "i": idx})
     except Exception:
         return False
 
@@ -542,7 +543,7 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
             if time.time() > start_deadline or len(tiles) >= MAX_TILES_PER_WEEK:
                 break
             # nombre borné d'éléments
-            n = ctx.evaluate("(sel,limit)=>Math.min(document.querySelectorAll(sel).length, limit)", css, MAX_CLICK_PER_SELECTOR)
+            n = ctx.evaluate("(p)=>Math.min(document.querySelectorAll(p.sel).length, p.limit)", {"sel": css, "limit": MAX_CLICK_PER_SELECTOR})
             for i in range(int(n)):
                 if time.time() > start_deadline or len(tiles) >= MAX_TILES_PER_WEEK:
                     break
