@@ -36,7 +36,7 @@ jobs:
       MAX_TILES_PER_WEEK: '100'      # bornage global par semaine
       WEEK_HARD_TIMEOUT_MS: '90000'  # timeout “semaine”
       TOOLTIP_WAIT_MS: '350'         # délai après clic avant lecture panneau
-     
+      PANEL_RETRIES: '8'
 
     steps:
       - uses: actions/checkout@v4
