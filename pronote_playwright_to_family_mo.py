@@ -36,9 +36,9 @@ WAIT_AFTER_NAV_MS      = int(os.getenv("WAIT_AFTER_NAV_MS", "1000"))
 
 # Bornes anti-hang
 MAX_TILES_PER_WEEK     = int(os.getenv("MAX_TILES_PER_WEEK", "120"))
-MAX_CLICK_PER_SELECTOR = int(os.getenv("MAX_CLICK_PER_SELECTOR", "80"))
-WEEK_HARD_TIMEOUT_MS   = int(os.getenv("WEEK_HARD_TIMEOUT_MS", "90000"))
-TOOLTIP_WAIT_MS        = int(os.getenv("TOOLTIP_WAIT_MS", "250"))
+MAX_CLICK_PER_SELECTOR = int(os.getenv("MAX_CLICK_PER_SELECTOR", "100"))
+WEEK_HARD_TIMEOUT_MS   = int(os.getenv("WEEK_HARD_TIMEOUT_MS", "120000"))
+PANEL_WAIT_MS          = int(os.getenv("PANEL_WAIT_MS", "350"))
 
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
@@ -107,7 +107,6 @@ def make_event_id(start: datetime, end: datetime, title: str, location: str) -> 
     return "prn_" + hashlib.sha1(key.encode()).hexdigest()[:24]
 
 def upsert_event_by_id(svc, cal_id: str, event_id: str, body: Dict[str, Any]) -> str:
-    from googleapiclient.errors import HttpError
     try:
         svc.events().get(calendarId=cal_id, eventId=event_id).execute()
         svc.events().patch(calendarId=cal_id, eventId=event_id, body=body, sendUpdates="none").execute()
@@ -124,15 +123,22 @@ H_PATTERNS = [
     re.compile(r'(?P<h>\\d{1,2})\\s*[hH:]\\s*(?P<m>\\d{2})'),
     re.compile(r'(?P<h>\\d{1,2})\\s*(?:heures?|hrs?)\\s*(?P<m>\\d{2})', re.IGNORECASE)
 ]
+DURATION_RE = re.compile(r'(?P<dh>\\d{1,2})\\s*[hH]\\s*(?P<dm>\\d{2})')
 
-def parse_timespan(text: str) -> Optional[tuple[tuple[int,int], tuple[int,int]]]:
-    found: List[tuple[int,int]] = []
+def parse_times(text: str) -> Dict[str, Optional[tuple[int,int]]]:
+    """Supporte: '08h05 - 09h00' OU '1h00 - lundi 08/09 à 08h05'"""
+    # Cherche deux heures (plage)
+    hours: List[tuple[int,int]] = []
     for rx in H_PATTERNS:
         for m in rx.finditer(text or ""):
-            found.append((int(m.group("h")), int(m.group("m"))))
-    if len(found) >= 2:
-        return found[0], found[1]
-    return None
+            hours.append((int(m.group("h")), int(m.group("m"))))
+    if len(hours) >= 2:
+        return {"start": hours[0], "end": hours[1], "duration": None}
+    # Cherche durée + heure de début
+    dm = DURATION_RE.search(text or "")
+    if dm and hours:
+        return {"start": hours[-1], "end": None, "duration": (int(dm.group("dh")), int(dm.group("dm")))}
+    return {"start": None, "end": None, "duration": None}
 
 MONTHS_FR = {
     "janvier":1, "février":2, "fevrier":2, "mars":3, "avril":4, "mai":5, "juin":6,
@@ -158,15 +164,38 @@ def to_dt(date_base: datetime, hm: tuple[int,int]) -> datetime:
 
 def parse_panel(panel: Dict[str, Any], year: int) -> Optional[Dict[str, Any]]:
     header = panel.get("header","")
-    matiere = panel.get("matiere","").strip()
-    salle = panel.get("salle","").strip()
-    span = parse_timespan(header) or parse_timespan(header.replace("heures","h"))
-    if not span: return None
+    matiere = (panel.get("matiere","") or "").strip()
+    matiere = re.sub(r'\\s+', ' ', matiere).strip()
+    # Garde seulement la 1ère ligne lisible (si multiples items)
+    if ' ' in matiere:
+        # souvent le texte est "PHYSIQUE-CHIMIE  ..." -> on garde jusqu'au 1er double espace
+        pass
+    salle = (panel.get("salle","") or "").strip()
+    salle = re.sub(r'\\s+', ' ', salle).strip()
+    # Parsing heures
+    times = parse_times(header)  # peut retourner durée
+    if not (times["start"] or times["end"]):
+        return None
     dt_date = parse_date_from_text(header, fallback_year=year)
-    if not dt_date: return None
-    start_dt = to_dt(dt_date, span[0])
-    end_dt   = to_dt(dt_date, span[1])
-    summary = matiere or re.sub(r'\\s+',' ', header.split('-',1)[-1]).strip() or "Cours"
+    if not dt_date:
+        return None
+    start_hm = times["start"]
+    end_hm = times["end"]
+    if start_hm and end_hm:
+        start_dt = to_dt(dt_date, start_hm)
+        end_dt   = to_dt(dt_date, end_hm)
+    elif start_hm and times["duration"]:
+        dh, dm = times["duration"]
+        start_dt = to_dt(dt_date, start_hm)
+        end_dt   = start_dt + timedelta(hours=dh, minutes=dm)
+    else:
+        return None
+    # Titre cours
+    summary = matiere or "Cours"
+    # Salle: récupère le dernier token typé salle si vide
+    if not salle:
+        m = re.search(r'(?:Salle[s]?\\s+)(.+)$', header, re.IGNORECASE)
+        if m: salle = m.group(1).strip()
     return {"summary": summary, "room": salle, "start_dt": start_dt, "end_dt": end_dt}
 
 # ===================== Playwright helpers =====================
@@ -222,33 +251,6 @@ def wait_timetable_any(page, timeout_ms: int = TIMEOUT_MS):
         page.wait_for_timeout(250)
     raise TimeoutError("Timetable not found")
 
-def click_text_anywhere(page, patterns: List[str]) -> bool:
-    for ctx in _iter_contexts(page):
-        for pat in patterns:
-            for loc in [ctx.get_by_role("link", name=re.compile(pat,re.I)),
-                        ctx.get_by_role("button", name=re.compile(pat,re.I))]:
-                try:
-                    if loc.count() > 0: loc.first.click(); return True
-                except Exception: pass
-            try:
-                found = ctx.evaluate(r"""
-                  (pat) => {
-                    const rx = new RegExp(pat,'i');
-                    const nodes = Array.from(document.querySelectorAll('body *')).filter(e => (e.innerText||'').match(rx));
-                    for (const n of nodes) {
-                      let p=n;
-                      while (p) {
-                        if (p.tagName==='A'||p.tagName==='BUTTON'||p.getAttribute('role')==='button'||p.onclick){p.click();return true;}
-                        p=p.parentElement;
-                      }
-                    }
-                    return false;
-                  }
-                """, pat)
-                if found: return True
-            except Exception: pass
-    return False
-
 def click_css_any(page, css: str, screenshot_tag: str = "") -> bool:
     if not css: return False
     for ctx in _iter_contexts(page):
@@ -261,7 +263,7 @@ def click_css_any(page, css: str, screenshot_tag: str = "") -> bool:
                 except Exception:
                     try:
                         el = loc.first.element_handle()
-                        if el: el.evaluate("(n)=>n.click()")
+                        if el: el.evaluate("(n)=>{ n.click(); n.dispatchEvent(new MouseEvent('mousedown',{bubbles:true})); n.dispatchEvent(new MouseEvent('mouseup',{bubbles:true})); n.dispatchEvent(new MouseEvent('click',{bubbles:true})); }")
                         else: continue
                     except Exception: continue
                 page.wait_for_timeout(WAIT_AFTER_NAV_MS)
@@ -368,7 +370,7 @@ def goto_timetable(pronote_page):
     attempts = [["Emploi du temps","Mon emploi du temps","Emplois du temps"],["Planning","Agenda"],["Vie scolaire","Emploi du temps"]]
     for i,pats in enumerate(attempts,1):
         for pat in pats:
-            if click_text_anywhere(pronote_page, [pat]):
+            if click_first_any(pronote_page, [f'*:has-text("{pat}")']):
                 accept_cookies_any(pronote_page)
                 try:
                     ctx = wait_timetable_any(pronote_page, timeout_ms=30_000)
@@ -386,7 +388,7 @@ def goto_timetable(pronote_page):
 
 def ensure_all_visible(page) -> None:
     if CLICK_TOUT_VOIR:
-        click_text_anywhere(page, ["Tout voir","Voir tout","Tout afficher"])
+        click_first_any(page, ['*:has-text("Tout voir")','*:has-text("Voir tout")','*:has-text("Tout afficher")'])
         page.wait_for_timeout(250)
 
 def goto_week_by_index(page, n: int) -> bool:
@@ -398,46 +400,39 @@ def goto_week_by_index(page, n: int) -> bool:
         except TimeoutError: pass
     return ok
 
-# ===================== Extraction =====================
+# ===================== Extraction (clic & panneau) =====================
 CANDIDATE_SELECTORS = [
     '[id^="id_"][id*="_coursInt_"] table',
     '[id^="id_"][id*="_coursInt_"]',
     '[id^="id_"][id*="_cont"]',
 ]
 
-def _click_panel_and_read(ctx, idx_sel: str, idx: int) -> Optional[Dict[str, Any]]:
-    # Clique un candidat puis lit le panneau ConteneurCours visible
-    clicked = ctx.evaluate("""(p)=>{
+def _click_candidate(ctx, sel: str, idx: int) -> bool:
+    return ctx.evaluate("""(p)=>{
       const sel=p.sel, i=p.i;
       const els = Array.from(document.querySelectorAll(sel));
-      if(!els[i]) return false;
       const el = els[i];
+      if(!el) return false;
       el.scrollIntoView({block:'center'});
-      try{ el.click(); }catch(e){} 
+      try { el.click(); } catch(e) {}
+      try { el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true})); el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true})); el.dispatchEvent(new MouseEvent('click',{bubbles:true})); } catch(e){}
       return true;
-    }""", {"sel": idx_sel, "i": idx})
-    if not clicked:
-        return None
-    # court délai pour laisser apparaître le panneau
-    time.sleep(TOOLTIP_WAIT_MS/1000.0)
-    panel = ctx.evaluate(r"""() => {
-      // récupérer le dernier ConteneurCours visible
+    }""", {"sel": sel, "i": idx})
+
+def _read_visible_panel(ctx) -> Optional[Dict[str, Any]]:
+    return ctx.evaluate(r"""() => {
       const vis = e => e && getComputedStyle(e).display!=='none' && e.offsetParent!==null;
       const panels = Array.from(document.querySelectorAll('.ConteneurCours')).filter(vis);
       if (!panels.length) return null;
       const p = panels[panels.length-1];
       const header = (p.querySelector('.EnteteCoursLibelle')?.innerText||'').replace(/\s+/g,' ').trim();
-      const getGroup = (name) => {
-        const grp = Array.from(p.querySelectorAll('[role="group"]')).find(g => (g.getAttribute('aria-label')||'').toLowerCase().includes(name));
-        if (!grp) return '';
-        const t = (grp.innerText||'').replace(/\s+/g,' ').trim();
-        return t;
+      const groups = Array.from(p.querySelectorAll('[role="group"]'));
+      const pick = (name) => {
+        const g = groups.find(x => (x.getAttribute('aria-label')||'').toLowerCase().includes(name));
+        return g ? (g.innerText||'').replace(/\s+/g,' ').trim() : '';
       };
-      const matiereTxt = getGroup('matière') || getGroup('matiere');
-      const sallesTxt  = getGroup('salles')  || getGroup('salle');
-      return { header, matiere: matiereTxt, salle: sallesTxt };
+      return { header, matiere: pick('matière') || pick('matiere'), salle: pick('salles') || pick('salle') };
     }""")
-    return panel
 
 def extract_week_info(pronote_page) -> Dict[str, Any]:
     ctx = wait_timetable_any(pronote_page, timeout_ms=30_000)
@@ -460,27 +455,26 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
     tiles: List[Dict[str, Any]] = []
     year = (monday.year if monday else datetime.now().year)
 
-    # 1) Essayer la paire coursInt/cont (rapide)
-    pairs = ctx.evaluate(r"""
-      () => {
-        const cours = Array.from(document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')).map(e=>e.id);
-        const conts = Array.from(document.querySelectorAll('[id^="id_"][id*="_cont"]')).map(e=>e.id);
-        return {cours, conts};
-      }
-    """)
-    if pairs and pairs.get("cours"):
-        # Si on a des cours, clique-les pour ouvrir le panneau et lire proprement
-        pass
-
-    # 2) Cliquer une série bornée de candidats et lire le panneau
-    total_clicked = 0
+    # Compte candidats pour transparence
+    counts = {}
     for sel in CANDIDATE_SELECTORS:
-        n = ctx.evaluate("(s)=>document.querySelectorAll(s).length", sel)
-        n = int(n or 0)
+        try:
+            c = ctx.evaluate("(s)=>document.querySelectorAll(s).length", sel)
+        except Exception:
+            c = 0
+        counts[sel] = int(c or 0)
+    _safe_write(f"{SCREEN_DIR}/edp_selector_counts.json", json.dumps(counts, ensure_ascii=False, indent=2))
+
+    # Clique séquentiellement des candidats et lit le panneau
+    for sel in CANDIDATE_SELECTORS:
+        n = counts.get(sel, 0)
         lim = min(n, MAX_CLICK_PER_SELECTOR, MAX_TILES_PER_WEEK - len(tiles))
         for i in range(lim):
-            panel = _click_panel_and_read(ctx, sel, i)
-            if not panel:
+            if not _click_candidate(ctx, sel, i):
+                continue
+            time.sleep(PANEL_WAIT_MS/1000.0)
+            panel = _read_visible_panel(ctx)
+            if not panel or not (panel.get("header") or panel.get("matiere")):
                 continue
             parsed = parse_panel(panel, year)
             if not parsed:
@@ -492,12 +486,9 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
                 "start_dt": parsed["start_dt"],
                 "end_dt": parsed["end_dt"]
             })
-            total_clicked += 1
-            # fermer en cliquant le body, si besoin
-            try:
-                ctx.evaluate("()=>document.body.click()")
-            except Exception:
-                pass
+            # fermer (si nécessaire)
+            try: ctx.evaluate("()=>document.body.click()")
+            except Exception: pass
             if len(tiles) >= MAX_TILES_PER_WEEK:
                 break
         if len(tiles) >= MAX_TILES_PER_WEEK:
@@ -507,10 +498,10 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         try: html_full = ctx.evaluate("() => document.documentElement.outerHTML")
         except Exception: html_full = ""
         _safe_write(f"{SCREEN_DIR}/edp_full_dom.html", html_full)
-        # dump aussi les ids candidats
         ids_dump = ctx.evaluate(r"""() => ({
           cours: Array.from(document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')).map(e=>e.id),
-          conts: Array.from(document.querySelectorAll('[id^="id_"][id*="_cont"]')).map(e=>e.id)
+          conts: Array.from(document.querySelectorAll('[id^="id_"][id*="_cont"]')).map(e=>e.id),
+          entetes: Array.from(document.querySelectorAll('.EnteteCoursLibelle')).map(e=>e.innerText.trim()).slice(0,50)
         })""")
         _safe_write(f"{SCREEN_DIR}/edp_candidates.json", json.dumps(ids_dump, ensure_ascii=False, indent=2))
 
@@ -577,7 +568,7 @@ def run() -> None:
                     'button[title*="suivante"]','button[aria-label*="suivante"]','a:has-text("Semaine suivante")'
                 ])
                 if clicked:
-                    accept_cookies_any(pronote); wait_timetable_any(pronote); _safe_shot(pronote, "09-next-week")
+                    wait_timetable_any(pronote); _safe_shot(pronote, "09-next-week")
                 else:
                     break
 
