@@ -18,7 +18,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# ===================== Variables d'env (inchangées) =====================
+# ===================== Variables d'env (inchangées + bornes debug) =====================
 ENT_URL       = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
 PRONOTE_URL   = os.getenv("PRONOTE_URL", "")
 ENT_USER      = os.getenv("PRONOTE_USER", "")
@@ -33,10 +33,17 @@ TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
 TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
 TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
 WEEK_TAB_TEMPLATE      = os.getenv("WEEK_TAB_TEMPLATE", "#GInterface\\.Instances\\[2\\]\\.Instances\\[0\\]_j_{n}").strip()
+
 FETCH_WEEKS_FROM       = int(os.getenv("FETCH_WEEKS_FROM", "1"))
 WEEKS_TO_FETCH         = int(os.getenv("WEEKS_TO_FETCH", "4"))
 CLICK_TOUT_VOIR        = os.getenv("CLICK_TOUT_VOIR", "1") == "1"
-WAIT_AFTER_NAV_MS      = int(os.getenv("WAIT_AFTER_NAV_MS", "1200"))  # un peu plus long par défaut
+WAIT_AFTER_NAV_MS      = int(os.getenv("WAIT_AFTER_NAV_MS", "1000"))
+
+# Bornes anti-hang (modifiables par env si besoin)
+MAX_TILES_PER_WEEK     = int(os.getenv("MAX_TILES_PER_WEEK", "60"))
+MAX_CLICK_PER_SELECTOR = int(os.getenv("MAX_CLICK_PER_SELECTOR", "18"))
+WEEK_HARD_TIMEOUT_MS   = int(os.getenv("WEEK_HARD_TIMEOUT_MS", "90000"))
+TOOLTIP_WAIT_MS        = int(os.getenv("TOOLTIP_WAIT_MS", "450"))
 
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
@@ -226,7 +233,7 @@ def wait_timetable_any(page, timeout_ms: int = TIMEOUT_MS):
                     return ctx
             except Exception:
                 pass
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(250)
     raise TimeoutError("Timetable not found")
 
 def click_text_anywhere(page, patterns: List[str]) -> bool:
@@ -422,7 +429,7 @@ def goto_timetable(pronote_page):
                     return ctx
                 except TimeoutError:
                     _safe_shot(pronote_page, f"08-not-ready-{i}-{pat}")
-        pronote_page.wait_for_timeout(600)
+        pronote_page.wait_for_timeout(400)
 
     try:
         ctx = wait_timetable_any(pronote_page, timeout_ms=15_000)
@@ -435,7 +442,7 @@ def goto_timetable(pronote_page):
 def ensure_all_visible(page) -> None:
     if CLICK_TOUT_VOIR:
         click_text_anywhere(page, ["Tout voir", "Voir tout", "Tout afficher"])
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(250)
 
 def goto_week_by_index(page, n: int) -> bool:
     if not WEEK_TAB_TEMPLATE:
@@ -449,87 +456,54 @@ def goto_week_by_index(page, n: int) -> bool:
             pass
     return ok
 
-# -------------------- Extraction --------------------
+# --------- Extraction rapide & bornée ---------
+TOOLTIP_SELECTORS = ['[role="tooltip"]','[class*="bulle"]','[class*="tooltip"]','[id*="tooltip"]']
+COURSE_CANDIDATE_SELECTORS = [
+    '[id^="id_"][id*="coursInt_"] table',
+    '[id^="id_"][id*="_cont"]',
+    '[aria-label]','[title]'
+]
+
 def _eval_candidates(ctx):
     return ctx.evaluate(r"""
-      () => {
-        const nodes = Array.from(document.querySelectorAll(
-          '[id^="id_"][id*="coursInt_"] table, [id^="id_"][id*="_cont"], [aria-label], [title]'
-        ));
-        return nodes.slice(0, 400).map(e => ({
-          id: e.id || '',
-          cls: e.className || '',
-          title: e.getAttribute('title') || '',
-          aria: e.getAttribute('aria-label') || '',
-          text: (e.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300)
-        }));
+      (sels, limit) => {
+        const uniq = new Set(), out = [];
+        for (const sel of sels) {
+          const els = Array.from(document.querySelectorAll(sel)).slice(0, limit);
+          for (const el of els) {
+            if (!el) continue;
+            const key = (el.id||'') + '|' + (el.className||'');
+            if (uniq.has(key)) continue;
+            uniq.add(key);
+            out.push({
+              sel, id: el.id||'', cls: el.className||'',
+              title: el.getAttribute('title')||'',
+              aria: el.getAttribute('aria-label')||'',
+              text: (el.innerText||'').replace(/\s+/g,' ').trim().slice(0, 300)
+            });
+          }
+        }
+        return out;
       }
-    """)
+    """, COURSE_CANDIDATE_SELECTORS, MAX_CLICK_PER_SELECTOR)
 
-def _parse_from_texts(cands: List[Dict[str,str]]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for c in cands:
-        txt = (c.get("aria") or c.get("title") or c.get("text") or "").strip()
-        if not txt:
-            continue
-        times = parse_timespan(txt)
-        if not times:
-            continue
-        d = parse_aria_label(txt)
-        if not d["start"] or not d["end"]:
-            continue
-        out.append({"label": txt, "dayIndex": None, "meta": c})
-    return out
+def _visible_tooltips(ctx):
+    return ctx.evaluate(r"""
+      (sels) => {
+        const out=[];
+        const vis = e => e && getComputedStyle(e).display!=='none' && e.offsetParent!==null;
+        for (const s of sels) {
+          document.querySelectorAll(s).forEach(e => { if (vis(e)) out.push((e.innerText||'').replace(/\s+/g,' ').trim()); });
+        }
+        return out;
+      }
+    """, TOOLTIP_SELECTORS)
 
-def _click_and_grab_tooltip(pronote_page, ctx) -> List[Dict[str, Any]]:
-    # Essaye d'ouvrir les bulles d'infos en cliquant plusieurs candidats
-    grabbed: List[Dict[str, Any]] = []
+def _click_nth(ctx, sel: str, idx: int) -> bool:
     try:
-        cnt = 0
-        # cible des candidats "cours" probables d'abord
-        css_list = [
-            '[id^="id_"][id*="coursInt_"] table',
-            '[id^="id_"][id*="_cont"]',
-            '[class*="cours"]',
-        ]
-        for css in css_list:
-            loc = ctx.locator(css)
-            n = min(loc.count(), 120)
-            for i in range(n):
-                try:
-                    el = loc.nth(i)
-                    el.scroll_into_view_if_needed()
-                    el.click()
-                    pronote_page.wait_for_timeout(120)
-                    # tous tooltips visibles
-                    t_texts = ctx.evaluate(r"""
-                      () => {
-                        const out = [];
-                        const vis = (e) => e && getComputedStyle(e).display !== 'none' && e.offsetParent !== null;
-                        const sel = ['[role="tooltip"]','[class*="bulle"]','[class*="tooltip"]','[id*="tooltip"]'];
-                        for (const s of sel) {
-                          document.querySelectorAll(s).forEach(e => {
-                            if (vis(e)) out.push((e.innerText||'').replace(/\s+/g,' ').trim());
-                          });
-                        }
-                        return out;
-                      }
-                    """)
-                    for tt in t_texts or []:
-                        if parse_timespan(tt):
-                            grabbed.append({"label": tt, "dayIndex": None})
-                    # clique à côté pour fermer
-                    ctx.evaluate("() => document.body.click()")
-                except Exception:
-                    pass
-                cnt += 1
-                if cnt >= 120:
-                    break
-            if cnt >= 120:
-                break
-    except Exception as e:
-        log(f"[DEBUG] tooltip click failed: {e}")
-    return grabbed
+        return ctx.evaluate("""(sel,i)=>{ const els = Array.from(document.querySelectorAll(sel)); if(!els[i]) return false; els[i].click(); return true;}""", sel, idx)
+    except Exception:
+        return False
 
 def extract_week_info(pronote_page) -> Dict[str, Any]:
     ctx = wait_timetable_any(pronote_page, timeout_ms=30_000)
@@ -540,14 +514,51 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         return m ? m[0] : '';
       }
     """)
+
+    start_deadline = time.time() + (WEEK_HARD_TIMEOUT_MS / 1000.0)
+
+    tiles: List[Dict[str, Any]] = []
+
+    # 1) Collecte directe (texte/title/aria)
     candidates = _eval_candidates(ctx)
-    tiles = _parse_from_texts(candidates)
+    for c in candidates:
+        if time.time() > start_deadline or len(tiles) >= MAX_TILES_PER_WEEK:
+            break
+        txt = (c.get("aria") or c.get("title") or c.get("text") or "").strip()
+        if not txt:
+            continue
+        times = parse_timespan(txt)
+        if not times:
+            continue
+        d = parse_aria_label(txt)
+        if not d["start"] or not d["end"]:
+            continue
+        tiles.append({"label": txt, "dayIndex": None, "meta": c})
 
-    # Fallback: cliquer pour déclencher les panneaux (si aucune tuile)
-    if not tiles:
-        tiles = _click_and_grab_tooltip(pronote_page, ctx)
+    # 2) Fallback: cliquer quelques candidats pour faire apparaître la bulle
+    if len(tiles) < 3 and time.time() <= start_deadline:
+        css_groups = COURSE_CANDIDATE_SELECTORS[:2]  # les deux sélecteurs PRONOTE d'abord
+        for css in css_groups:
+            if time.time() > start_deadline or len(tiles) >= MAX_TILES_PER_WEEK:
+                break
+            # nombre borné d'éléments
+            n = ctx.evaluate("(sel,limit)=>Math.min(document.querySelectorAll(sel).length, limit)", css, MAX_CLICK_PER_SELECTOR)
+            for i in range(int(n)):
+                if time.time() > start_deadline or len(tiles) >= MAX_TILES_PER_WEEK:
+                    break
+                if not _click_nth(ctx, css, i):
+                    continue
+                pronote_page.wait_for_timeout(TOOLTIP_WAIT_MS)
+                # lire tooltips visibles
+                for t in _visible_tooltips(ctx):
+                    if not parse_timespan(t):
+                        continue
+                    tiles.append({"label": t, "dayIndex": None})
+                # clic body pour fermer
+                try: ctx.evaluate("()=>document.body.click()")
+                except Exception: pass
 
-    # Dump debug si toujours vide
+    # 3) Dump si vide
     if not tiles:
         try:
             html_full = ctx.evaluate("() => document.documentElement.outerHTML")
@@ -556,6 +567,7 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         _safe_write(f"{SCREEN_DIR}/edp_full_dom.html", html_full)
         _safe_write(f"{SCREEN_DIR}/edp_candidates.json", json.dumps(candidates, ensure_ascii=False, indent=2))
 
+    # Date base (lundi)
     d0 = None
     try:
         m = re.search(r'(\\d{2}/\\d{2}/\\d{4}).*?(\\d{2}/\\d{2}/\\d{4})', header_text or '')
@@ -606,13 +618,20 @@ def run() -> None:
             ensure_all_visible(pronote)
             _safe_shot(pronote, f"08-week-{week_idx}-after-select")
 
+            week_deadline = time.time() + (WEEK_HARD_TIMEOUT_MS / 1000.0)
+
             info  = extract_week_info(pronote)
             d0    = info["monday"]
             tiles = info["tiles"] or []
             hdr   = (info.get("header") or "").replace("\\n", " ")[:160]
             log(f"Semaine {week_idx}: {len(tiles)} cases, header='{hdr}'")
 
+            if not tiles and time.time() < week_deadline:
+                log("Aucune case détectée — voir dumps edp_full_dom.html / edp_candidates.json")
             for t in tiles:
+                if time.time() > week_deadline:
+                    log("Week timeout reached, moving on")
+                    break
                 label = (t.get("label") or "").strip()
                 if not label:
                     continue
