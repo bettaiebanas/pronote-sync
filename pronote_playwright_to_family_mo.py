@@ -452,10 +452,9 @@ def goto_week_by_index(page, n: int) -> bool:
 
 # ========= Extraction (sur le FRAME TIMETABLE !) =========
 def extract_week_info_from_frame(fr) -> Dict[str, Any]:
-    # Header semaine
+    # 1) Header semaine (pour récupérer le lundi si possible)
     header_text = ""
     try:
-        # On tente différents endroits courants
         header_text = fr.evaluate(r"""
           () => {
             const picks = [
@@ -469,77 +468,87 @@ def extract_week_info_from_frame(fr) -> Dict[str, Any]:
                 if (t) return t;
               } catch {}
             }
-            const txt = (document.body.innerText||'').trim();
-            return txt;
+            return (document.body.innerText||'').trim();
           }
         """) or ""
     except:
         header_text = ""
 
-    # Cases (uniquement dans CE frame !)
+    # 2) Cases : stratégie "sans attributs"
+    # - on prend tout élément dont le texte contient 2 horaires (début/fin)
+    # - on récupère son centre X/Y
+    # - on grouppe les X en colonnes → dayIndex 0..6
     tiles = fr.evaluate(r"""
       () => {
         const out = [];
-        const add = (el, label) => {
-          if (!label) return;
-          let dayIndex = null, p = el;
-          while (p) {
-            if (p.getAttribute && p.getAttribute('data-dayindex')) { dayIndex = parseInt(p.getAttribute('data-dayindex')); break; }
-            p = p.parentElement;
-          }
-          out.push({ label, dayIndex });
-        };
-        const rx = /\d{1,2}\s*[:hH]\s*\d{2}.*\d{1,2}\s*[:hH]\s*\d{2}/;
+        const rx = /\b\d{1,2}\s*[:hH]\s*\d{2}.*\d{1,2}\s*[:hH]\s*\d{2}\b/; // deux heures dans la même chaîne
 
-        document.querySelectorAll('[aria-label]').forEach(e => {
-          const v = e.getAttribute('aria-label'); if (v && rx.test(v)) add(e, v);
-        });
-        document.querySelectorAll('[title]').forEach(e => {
-          const v = e.getAttribute('title'); if (v && rx.test(v)) add(e, v);
+        // Récupère candidats (on évite le body entier; on parcourt tous les noeuds "visibles")
+        const all = Array.from(document.querySelectorAll('body *'))
+          .filter(e => {
+            const t = (e.innerText || '').trim();
+            if (!t) return false;
+            if (t.length > 220) return false;          // évite les gros blocs
+            if (!rx.test(t)) return false;             // il faut 2 horaires
+            const r = e.getBoundingClientRect();
+            if (!r || r.width < 5 || r.height < 5) return false; // trop petit = bruit
+            // ignore barres/menus horizontaux (hauteur très faible) ?
+            return true;
+          });
+
+        // Construire tableau brut avec centre X pour regrouper en colonnes
+        const raw = all.map(e => {
+          const r = e.getBoundingClientRect();
+          return {
+            el: e,
+            label: (e.innerText||'').trim(),
+            cx: r.left + r.width/2,
+            cy: r.top + r.height/2,
+          };
         });
 
-        // texte court (évite d’attraper la page d’accueil « Aujourd'hui »)
-        document.querySelectorAll('[class*="Case"], [class*="Cours"], .edt *').forEach(e => {
-          const t = (e.innerText || '').trim();
-          if (t && t.length < 160 && rx.test(t)) add(e, t);
+        if (raw.length === 0) return { header: document.body.innerText || '', tiles: [] };
+
+        // Clustering 1D sur X : on trie par X et on crée des "buckets" si l'écart > seuil
+        raw.sort((a,b)=>a.cx-b.cx);
+        const buckets = [];
+        const TH = Math.max(30, (raw[raw.length-1].cx - raw[0].cx)/30); // seuil adaptatif
+        let cur = [raw[0]];
+        for (let i=1;i<raw.length;i++){
+          if (Math.abs(raw[i].cx - raw[i-1].cx) <= TH) cur.push(raw[i]);
+          else { buckets.push(cur); cur=[raw[i]]; }
+        }
+        buckets.push(cur);
+
+        // Map colonne -> dayIndex (0..6) gauche→droite
+        // (si plus de 7 colonnes on tronque; si moins, on garde ce qu’on a)
+        const dayMap = new Map();
+        buckets.forEach((arr, idx) => {
+          arr.forEach(x => dayMap.set(x, Math.min(idx, 6)));
         });
 
-        return out;
+        // Dé-dupliquer par (label, colonne) pour éviter 5 copies de la même case imbriquée
+        const seen = new Set();
+        const tiles = [];
+        for (const x of raw) {
+          const d = dayMap.get(x);
+          const key = d + '|' + x.label;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          tiles.push({ label: x.label, dayIndex: d });
+        }
+
+        return { header: header_text = (document.querySelector('.zoneSemaines')||{}).innerText || '',
+                 tiles };
       }
-    """) or []
+    """) or {}
 
-    return {"header": header_text, "tiles": tiles}
+    # Dans certains cas, l'inner eval ci-dessus renvoie {header:'', tiles:[...]}.
+    # On combine proprement avec le header lu au début.
+    header = tiles.get("header") if isinstance(tiles, dict) and tiles.get("header") else header_text
+    real_tiles = tiles.get("tiles") if isinstance(tiles, dict) else tiles
 
-def merge_adjacent(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Fusionne les demi-séances contiguës/chevauchantes (même jour, même matière+lieu)."""
-    if not entries:
-        return entries
-    # Clé de fusion
-    def k(e):
-        return (e["dayIndex"], _norm(e["summary"]), _norm(e["room"]))
-    # group by key
-    groups: Dict[Any, List[Dict[str, Any]]] = {}
-    for e in entries:
-        groups.setdefault(k(e), []).append(e)
-    merged: List[Dict[str, Any]] = []
-    for _, arr in groups.items():
-        arr.sort(key=lambda x: x["start_dt"])
-        cur = None
-        for e in arr:
-            if not cur:
-                cur = dict(e)
-                continue
-            # si overlap ou gap <= 10 min → fusion
-            gap = (e["start_dt"] - cur["end_dt"]).total_seconds() / 60.0
-            if gap <= 10:
-                if e["end_dt"] > cur["end_dt"]:
-                    cur["end_dt"] = e["end_dt"]
-            else:
-                merged.append(cur)
-                cur = dict(e)
-        if cur:
-            merged.append(cur)
-    return merged
+    return {"header": header or header_text, "tiles": real_tiles or []}
 
 # ========= Main =========
 def run():
