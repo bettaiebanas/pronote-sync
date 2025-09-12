@@ -32,6 +32,12 @@ jobs:
       WAIT_AFTER_NAV_MS:      '1000'
       CLICK_TOUT_VOIR:        '1'
 
+      MAX_CLICK_PER_SELECTOR: '80'   # baisse si tu veux accélérer
+      MAX_TILES_PER_WEEK: '120'      # bornage global par semaine
+      WEEK_HARD_TIMEOUT_MS: '90000'  # timeout “semaine”
+      TOOLTIP_WAIT_MS: '250'         # délai après clic avant lecture panneau
+     
+
     steps:
       - uses: actions/checkout@v4
 
