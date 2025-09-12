@@ -1,100 +1,169 @@
-name: pronote-to-family-mo (Playwright)
+# -*- coding: utf-8 -*-
+"""
+sync.py — orchestrateur pour pronote_playwright_to_family_mo.py
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '5 6,16 * * *'   # 06:05 et 16:05 UTC ≈ 08:05/18:05 Paris
+- Crée credentials.json / token.json depuis les ENV si fournis
+- (Re)met pip en place si absent, installe dépendances Python
+- Installe les navigateurs Playwright (Chromium)
+- Lance la synchro (import et appel direct de run())
+"""
 
-jobs:
-  sync:
-    runs-on: [self-hosted, Windows]
+import os, sys, json, subprocess, shutil, textwrap, traceback
+from pathlib import Path
 
-    defaults:
-      run:
-        shell: powershell
+# ---- Config basique
+ROOT = Path(__file__).resolve().parent
+PY   = sys.executable
+SCREEN_DIR = ROOT / "screenshots"
 
-    env:
-      # Identifiants ENT (déjà dans tes secrets)
-      PRONOTE_USER: ${{ secrets.PRONOTE_USER }}
-      PRONOTE_PASS: ${{ secrets.PRONOTE_PASS }}
+ENV_PRINT_KEYS = [
+    "ENT_URL", "PRONOTE_URL", "CALENDAR_ID", "HEADFUL",
+    "TIMETABLE_PRE_SELECTOR", "TIMETABLE_SELECTOR", "TIMETABLE_FRAME",
+    "WEEK_TAB_TEMPLATE", "FETCH_WEEKS_FROM", "WEEKS_TO_FETCH",
+    "WAIT_AFTER_NAV_MS", "CLICK_TOUT_VOIR", "DEBUG"
+]
 
-      # Cible Google Calendar (laisse tel quel si c'est bien le calendrier Famille)
-      CALENDAR_ID:  family15066434840617961429@group.calendar.google.com
+REQS = [
+    "playwright",
+    "google-api-python-client",
+    "google-auth-httplib2",
+    "google-auth-oauthlib",
+    "python-dateutil",
+]
 
-      # URLs ENT/PRONOTE (tes valeurs)
-      ENT_URL:      https://ent77.seine-et-marne.fr/welcome
-      PRONOTE_URL:  https://0771342r.index-education.net/pronote/parent.html
+def log(msg: str):
+    print(msg, flush=True)
 
-      # Voir le navigateur (HEADFUL=1 sur self-hosted)
-      HEADFUL:      "1"
+def run_cmd(args, check=True):
+    log(f"[CMD] {' '.join(args)}")
+    return subprocess.run(args, check=check)
 
-      # Sélecteurs relevés sur ton instance PRONOTE
-      TIMETABLE_PRE_SELECTOR: '#GInterface\.Instances\[0\]\.Instances\[1\]_Combo5'
-      TIMETABLE_SELECTOR:     '#GInterface\.Instances\[0\]\.Instances\[1\]_Liste_niveau5 > ul > li:nth-child(1) > div > div'
-      TIMETABLE_FRAME:        'parent.html'
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
-      # Onglets semaines j_1, j_2, j_3…
-      WEEK_TAB_TEMPLATE: '#GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}'
-      FETCH_WEEKS_FROM: '1'
-      WEEKS_TO_FETCH:   '4'
+def write_secret_file(filename: str, env_var: str):
+    val = os.getenv(env_var, "")
+    if not val:
+        return False
+    try:
+        (ROOT / filename).write_text(val, encoding="utf-8")
+        log(f"[OK] {filename} écrit depuis ${env_var}")
+        return True
+    except Exception as e:
+        log(f"[WARN] impossible d’écrire {filename}: {e}")
+        return False
 
-      # Divers
-      WAIT_AFTER_NAV_MS: '1000'
-      CLICK_TOUT_VOIR:   '1'
+def ensure_pip():
+    # certains toolcache windows n’ont pas pip dispo par défaut
+    try:
+        run_cmd([PY, "-m", "pip", "--version"], check=True)
+        log("[OK] pip déjà présent")
+        return
+    except Exception:
+        log("[INFO] pip absent — tentative ensurepip")
+    try:
+        run_cmd([PY, "-m", "ensurepip", "--upgrade"], check=True)
+        run_cmd([PY, "-m", "pip", "install", "-U", "pip", "setuptools", "wheel"], check=True)
+        log("[OK] pip (ré)installé")
+    except Exception as e:
+        log(f"[WARN] échec ensurepip/pip upgrade: {e}")
 
-    steps:
-      - uses: actions/checkout@v4
+def install_requirements():
+    for pkg in REQS:
+        try:
+            run_cmd([PY, "-m", "pip", "install", "-U", pkg], check=True)
+        except subprocess.CalledProcessError as e:
+            log(f"[ERR] pip install {pkg} a échoué: rc={e.returncode}")
+            raise
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          architecture: 'x64'
+def ensure_playwright_browsers():
+    # Evite de dépendre du PATH : toujours via "python -m playwright"
+    try:
+        run_cmd([PY, "-m", "playwright", "install", "chromium"], check=True)
+        log("[OK] Playwright Chromium installé")
+    except subprocess.CalledProcessError as e:
+        log(f"[ERR] playwright install chromium a échoué (rc={e.returncode})")
+        raise
 
-      - name: Jitter aléatoire (30s–5min)
-        run: Start-Sleep -Seconds (Get-Random -Minimum 30 -Maximum 300)
+def print_env_overview():
+    log("[ENV] variables utiles :")
+    for k in ENV_PRINT_KEYS:
+        v = os.getenv(k)
+        if v is None:
+            log(f"  - {k}=<absent>")
+        else:
+            show = v if k not in ("PRONOTE_URL",) else v  # on masque rien ici sauf si tu veux
+            log(f"  - {k}={show}")
 
-      - name: IP publique du job
-        run: |
-          try {
-            $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
-            Write-Host "IP publique du job: $ip"
-          } catch {
-            Write-Host "IP non récupérée: $($_.Exception.Message)"
-          }
+    # On ne log pas les secrets
+    for secret in ("PRONOTE_USER", "PRONOTE_PASS", "GCAL_CLIENT_SECRET", "GCAL_TOKEN_JSON"):
+        log(f"  - {secret}={'<set>' if os.getenv(secret) else '<absent>'}")
 
-      - name: Recréer OAuth Google (depuis secrets)
-        run: |
-          Set-Content -Path credentials.json -Value '${{ secrets.GCAL_CLIENT_SECRET }}' -NoNewline
-          Set-Content -Path token.json        -Value '${{ secrets.GCAL_TOKEN_JSON }}'  -NoNewline
+def maybe_print_public_ip():
+    try:
+        import urllib.request, json as _json
+        ip = _json.loads(urllib.request.urlopen("https://api.ipify.org?format=json", timeout=5).read())["ip"]
+        log(f"[NET] IP publique du job: {ip}")
+    except Exception as e:
+        log(f"[NET] IP publique non récupérée: {e}")
 
-      - name: Bootstrap pip (toolcache Windows)
-        run: |
-          & "$env:pythonLocation\python.exe" -V
-          & "$env:pythonLocation\python.exe" -m ensurepip --upgrade
-          & "$env:pythonLocation\python.exe" -m pip --version
-          & "$env:pythonLocation\python.exe" -m pip install --upgrade pip setuptools wheel
+def main():
+    ensure_dir(SCREEN_DIR)
+    log(f"[PY] {PY}")
+    log(f"[PY] {sys.version}")
+    print_env_overview()
+    maybe_print_public_ip()
 
-      - name: Installer dépendances Python
-        run: |
-          & "$env:pythonLocation\python.exe" -m pip install playwright google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
+    # 1) secrets -> fichiers
+    wrote_creds = write_secret_file("credentials.json", "GCAL_CLIENT_SECRET")
+    wrote_token = write_secret_file("token.json", "GCAL_TOKEN_JSON")
+    if not (Path("credentials.json").exists() or wrote_creds):
+        log("[WARN] credentials.json introuvable et $GCAL_CLIENT_SECRET absent. OAuth demandera un consentement local si requis.")
+    if not Path("token.json").exists():
+        log("[INFO] token.json non présent (normale si première exécution)")
 
-      - name: Installer Chromium (Playwright)
-        run: |
-          & "$env:pythonLocation\python.exe" -m playwright install chromium
+    # 2) pip & deps
+    ensure_pip()
+    try:
+        install_requirements()
+    except Exception:
+        log("[FATAL] Installation deps échouée")
+        sys.exit(1)
 
-      - name: Créer dossier screenshots
-        run: New-Item -ItemType Directory -Force -Path screenshots | Out-Null
+    # 3) navigateurs Playwright
+    try:
+        ensure_playwright_browsers()
+    except Exception:
+        log("[FATAL] Install des navigateurs Playwright échouée")
+        sys.exit(1)
 
-      - name: Lancer la synchro Playwright -> Google Calendar
-        run: |
-          & "$env:pythonLocation\python.exe" .\pronote_playwright_to_family_mo.py
+    # 4) Exécution de la synchro
+    try:
+        # import direct pour garder le même interpréteur/environnement
+        import pronote_playwright_to_family_mo as sync_mod
+    except Exception as e:
+        log(f"[FATAL] import pronote_playwright_to_family_mo KO: {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
-      - name: Upload artefacts (captures + dumps DOM)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots
-          path: |
-            screenshots/**
-            dom-*.html
-          if-no-files-found: ignore
+    try:
+        sync_mod.run()
+    except SystemExit as e:
+        # le module peut faire SystemExit(1)
+        rc = int(getattr(e, "code", 1) or 1)
+        log(f"[FATAL] run() a levé SystemExit({rc})")
+        sys.exit(rc)
+    except Exception as e:
+        log(f"[FATAL] Exception dans run(): {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    log("[DONE] sync terminée sans exception")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as ex:
+        log(f"[FATAL] sync.py a échoué: {ex}")
+        traceback.print_exc()
+        sys.exit(1)
