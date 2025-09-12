@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+import json
 import hashlib
 import unicodedata
 from datetime import datetime, timedelta
@@ -32,11 +33,10 @@ TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
 TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
 TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
 WEEK_TAB_TEMPLATE      = os.getenv("WEEK_TAB_TEMPLATE", "#GInterface\\.Instances\\[2\\]\\.Instances\\[0\\]_j_{n}").strip()
-
 FETCH_WEEKS_FROM       = int(os.getenv("FETCH_WEEKS_FROM", "1"))
 WEEKS_TO_FETCH         = int(os.getenv("WEEKS_TO_FETCH", "4"))
 CLICK_TOUT_VOIR        = os.getenv("CLICK_TOUT_VOIR", "1") == "1"
-WAIT_AFTER_NAV_MS      = int(os.getenv("WAIT_AFTER_NAV_MS", "800"))
+WAIT_AFTER_NAV_MS      = int(os.getenv("WAIT_AFTER_NAV_MS", "1200"))  # un peu plus long par défaut
 
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
@@ -48,7 +48,6 @@ SCREEN_DIR  = "screenshots"
 
 # ===================== IO-safe console =====================
 try:
-    # Force UTF-8 console where supported to avoid 'charmap' errors on Windows runners
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
@@ -61,7 +60,6 @@ def log(msg: str) -> None:
     try:
         print(line)
     except UnicodeEncodeError:
-        # Fallback ASCII
         safe = (line.encode("ascii", "replace")).decode("ascii")
         print(safe)
 
@@ -79,6 +77,14 @@ def _safe_mkdir(p: str) -> None:
         os.makedirs(p, exist_ok=True)
     except Exception:
         pass
+
+def _safe_write(path: str, data: str, mode: str = "w", enc: str = "utf-8") -> None:
+    try:
+        _safe_mkdir(os.path.dirname(path) or ".")
+        with open(path, mode, encoding=enc) as f:
+            f.write(data)
+    except Exception as e:
+        log(f"[DEBUG] write fail {path}: {e}")
 
 def _safe_shot(page, name: str) -> None:
     try:
@@ -443,6 +449,88 @@ def goto_week_by_index(page, n: int) -> bool:
             pass
     return ok
 
+# -------------------- Extraction --------------------
+def _eval_candidates(ctx):
+    return ctx.evaluate(r"""
+      () => {
+        const nodes = Array.from(document.querySelectorAll(
+          '[id^="id_"][id*="coursInt_"] table, [id^="id_"][id*="_cont"], [aria-label], [title]'
+        ));
+        return nodes.slice(0, 400).map(e => ({
+          id: e.id || '',
+          cls: e.className || '',
+          title: e.getAttribute('title') || '',
+          aria: e.getAttribute('aria-label') || '',
+          text: (e.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300)
+        }));
+      }
+    """)
+
+def _parse_from_texts(cands: List[Dict[str,str]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for c in cands:
+        txt = (c.get("aria") or c.get("title") or c.get("text") or "").strip()
+        if not txt:
+            continue
+        times = parse_timespan(txt)
+        if not times:
+            continue
+        d = parse_aria_label(txt)
+        if not d["start"] or not d["end"]:
+            continue
+        out.append({"label": txt, "dayIndex": None, "meta": c})
+    return out
+
+def _click_and_grab_tooltip(pronote_page, ctx) -> List[Dict[str, Any]]:
+    # Essaye d'ouvrir les bulles d'infos en cliquant plusieurs candidats
+    grabbed: List[Dict[str, Any]] = []
+    try:
+        cnt = 0
+        # cible des candidats "cours" probables d'abord
+        css_list = [
+            '[id^="id_"][id*="coursInt_"] table',
+            '[id^="id_"][id*="_cont"]',
+            '[class*="cours"]',
+        ]
+        for css in css_list:
+            loc = ctx.locator(css)
+            n = min(loc.count(), 120)
+            for i in range(n):
+                try:
+                    el = loc.nth(i)
+                    el.scroll_into_view_if_needed()
+                    el.click()
+                    pronote_page.wait_for_timeout(120)
+                    # tous tooltips visibles
+                    t_texts = ctx.evaluate(r"""
+                      () => {
+                        const out = [];
+                        const vis = (e) => e && getComputedStyle(e).display !== 'none' && e.offsetParent !== null;
+                        const sel = ['[role="tooltip"]','[class*="bulle"]','[class*="tooltip"]','[id*="tooltip"]'];
+                        for (const s of sel) {
+                          document.querySelectorAll(s).forEach(e => {
+                            if (vis(e)) out.push((e.innerText||'').replace(/\s+/g,' ').trim());
+                          });
+                        }
+                        return out;
+                      }
+                    """)
+                    for tt in t_texts or []:
+                        if parse_timespan(tt):
+                            grabbed.append({"label": tt, "dayIndex": None})
+                    # clique à côté pour fermer
+                    ctx.evaluate("() => document.body.click()")
+                except Exception:
+                    pass
+                cnt += 1
+                if cnt >= 120:
+                    break
+            if cnt >= 120:
+                break
+    except Exception as e:
+        log(f"[DEBUG] tooltip click failed: {e}")
+    return grabbed
+
 def extract_week_info(pronote_page) -> Dict[str, Any]:
     ctx = wait_timetable_any(pronote_page, timeout_ms=30_000)
     header_text = ctx.evaluate(r"""
@@ -452,51 +540,21 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         return m ? m[0] : '';
       }
     """)
-    tiles = ctx.evaluate(r"""
-      () => {
-        const out = [];
-        const add = (el, label) => {
-          if (!label) return;
-          let dayIndex = null, p = el;
-          while (p) {
-            if (p.getAttribute && p.getAttribute('data-dayindex')) {
-              const v = parseInt(p.getAttribute('data-dayindex'));
-              if (!Number.isNaN(v)) { dayIndex = v; }
-              break;
-            }
-            p = p.parentElement;
-          }
-          out.push({ label, dayIndex });
-        };
-        const rx = /(\d{1,2}\s*[h:]\s*\d{2}).{0,80}(\d{1,2}\s*[h:]\s*\d{2})/i;
-        document.querySelectorAll('[aria-label],[title]').forEach(e => {
-          const v = e.getAttribute('aria-label') || e.getAttribute('title') || '';
-          if (rx.test(v)) add(e, v);
-        });
-        Array.from(document.querySelectorAll('body *')).forEach(e => {
-          const t = (e.innerText || '').trim();
-          if (t && t.length < 260 && rx.test(t)) add(e, t);
-        });
-        return out;
-      }
-    """)
-    if not tiles or len(tiles) < 3:
-        extra = ctx.evaluate(r"""
-          () => {
-            const out = [];
-            const rx = /(\d{1,2}\s*[h:]\s*\d{2}).{0,100}(\d{1,2}\s*[h:]\s*\d{2})/i;
-            const pushIf = (el) => {
-              if (!el) return;
-              const txt = (el.innerText || '').replace(/\s+/g,' ').trim();
-              if (txt && rx.test(txt)) {
-                out.push({ label: txt, dayIndex: null });
-              }
-            };
-            document.querySelectorAll('[id^="id_"][id*="coursInt_"] table, [id^="id_"][id*="cont"]').forEach(pushIf);
-            return out;
-          }
-        """)
-        tiles = (tiles or []) + (extra or [])
+    candidates = _eval_candidates(ctx)
+    tiles = _parse_from_texts(candidates)
+
+    # Fallback: cliquer pour déclencher les panneaux (si aucune tuile)
+    if not tiles:
+        tiles = _click_and_grab_tooltip(pronote_page, ctx)
+
+    # Dump debug si toujours vide
+    if not tiles:
+        try:
+            html_full = ctx.evaluate("() => document.documentElement.outerHTML")
+        except Exception:
+            html_full = ""
+        _safe_write(f"{SCREEN_DIR}/edp_full_dom.html", html_full)
+        _safe_write(f"{SCREEN_DIR}/edp_candidates.json", json.dumps(candidates, ensure_ascii=False, indent=2))
 
     d0 = None
     try:
@@ -546,6 +604,7 @@ def run() -> None:
             used_tab = goto_week_by_index(pronote, week_idx)
             accept_cookies_any(pronote)
             ensure_all_visible(pronote)
+            _safe_shot(pronote, f"08-week-{week_idx}-after-select")
 
             info  = extract_week_info(pronote)
             d0    = info["monday"]
