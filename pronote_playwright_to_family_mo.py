@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# pronote_playwright_to_family_mo.py
 import os, sys, re, hashlib, unicodedata, time
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
@@ -10,38 +10,37 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# ========= CONFIG =========
-ENT_URL     = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
-PRONOTE_URL = os.getenv("PRONOTE_URL", "")  # si vide : on clique la tuile PRONOTE depuis l’ENT
-ENT_USER    = os.getenv("PRONOTE_USER", "")
-ENT_PASS    = os.getenv("PRONOTE_PASS", "")
+# ========= CONFIG (mêmes noms qu'avant) =========
+ENT_URL       = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
+PRONOTE_URL   = os.getenv("PRONOTE_URL", "")     # si vide: clic sur la tuile PRONOTE depuis l’ENT
+ENT_USER      = os.getenv("PRONOTE_USER", "")
+ENT_PASS      = os.getenv("PRONOTE_PASS", "")
 
-# Sélecteurs validés avec toi (ENT → Vie scolaire → Emploi du temps)
-TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()   # Vie scolaire
-TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()       # Emploi du temps
-TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()          # ex: parent.html
-WEEK_TAB_TEMPLATE      = os.getenv("WEEK_TAB_TEMPLATE", "").strip()        # ex: #GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}
+CALENDAR_ID   = os.getenv("CALENDAR_ID", "family15066434840617961429@group.calendar.google.com")
+TITLE_PREFIX  = "[Mo] "
+COLOR_ID      = "6"                              # 6 = orange
+HEADFUL       = os.getenv("HEADFUL", "0") == "1"
 
-FETCH_WEEKS_FROM = int(os.getenv("FETCH_WEEKS_FROM", "1"))
-WEEKS_TO_FETCH   = int(os.getenv("WEEKS_TO_FETCH",   "4"))
-WAIT_AFTER_NAV_MS = int(os.getenv("WAIT_AFTER_NAV_MS", "800"))
-CLICK_TOUT_VOIR   = os.getenv("CLICK_TOUT_VOIR", "1") == "1"
-
-CALENDAR_ID  = os.getenv("CALENDAR_ID", "family15066434840617961429@group.calendar.google.com")
-TITLE_PREFIX = "[Mo] "
-COLOR_ID     = "6"   # orange
-HEADFUL      = os.getenv("HEADFUL", "0") == "1"
+# (facultatifs: laissent vide si tu ne veux pas les gérer côté workflow)
+TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
+TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
+TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
+WEEK_TAB_TEMPLATE      = os.getenv("WEEK_TAB_TEMPLATE", "").strip()  # ex: #GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}
+FETCH_WEEKS_FROM       = int(os.getenv("FETCH_WEEKS_FROM", "1"))
+WEEKS_TO_FETCH         = int(os.getenv("WEEKS_TO_FETCH", "6"))       # ≈ 1 mois
+CLICK_TOUT_VOIR        = os.getenv("CLICK_TOUT_VOIR", "1") == "1"
+WAIT_AFTER_NAV_MS      = int(os.getenv("WAIT_AFTER_NAV_MS", "800"))
 
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 # Timeouts (ms)
-TIMEOUT_MS = 120_000
-SCREEN_DIR = "screenshots"
+TIMEOUT_MS  = 120_000
+SCREEN_DIR  = "screenshots"
 
 # ========= Google Calendar =========
-def gcal_service():
+def get_gcal_service():
     creds = None
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
@@ -60,36 +59,31 @@ def gcal_service():
             f.write(creds.to_json())
     return build("calendar", "v3", credentials=creds)
 
-# Dédup via propriété étendue privée
+# ---- Dédup béton : id d’événement stable ----
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
 
-def make_hash_id(start: datetime, end: datetime, title: str, location: str) -> str:
-    base = f"{start.isoformat()}|{end.isoformat()}|{_norm(title)}|{_norm(location)}"
-    return hashlib.md5(base.encode("utf-8")).hexdigest()
+def make_event_id(start: datetime, end: datetime, title: str, location: str) -> str:
+    # Alphabet autorisé: a-z 0-9 _ -
+    key = f"{start.isoformat()}|{end.isoformat()}|{_norm(title)}|{_norm(location)}"
+    return "prn_" + hashlib.sha1(key.encode()).hexdigest()[:24]
 
-def find_event_by_hash(svc, cal_id: str, h: str):
-    resp = svc.events().list(
-        calendarId=cal_id,
-        privateExtendedProperty=f"mo_hash={h}",
-        singleEvents=True,
-        maxResults=1,
-        orderBy="startTime",
-    ).execute()
-    items = resp.get("items", [])
-    return items[0] if items else None
-
-def upsert_event_by_hash(svc, cal_id: str, h: str, body: Dict[str, Any]) -> str:
-    existing = find_event_by_hash(svc, cal_id, h)
-    if existing:
-        ev_id = existing["id"]
-        svc.events().update(calendarId=cal_id, eventId=ev_id, body=body, sendUpdates="none").execute()
+def upsert_event_by_id(svc, cal_id: str, event_id: str, body: Dict[str, Any]) -> str:
+    try:
+        # existe ?
+        svc.events().get(calendarId=cal_id, eventId=event_id).execute()
+        svc.events().patch(calendarId=cal_id, eventId=event_id, body=body, sendUpdates="none").execute()
         return "updated"
-    else:
-        svc.events().insert(calendarId=cal_id, body=body, sendUpdates="none").execute()
-        return "created"
+    except HttpError as e:
+        if getattr(e, "resp", None) and e.resp.status == 404:
+            # crée avec le même id (mettre l'id DANS le body)
+            body2 = dict(body)
+            body2["id"] = event_id
+            svc.events().insert(calendarId=cal_id, body=body2, sendUpdates="none").execute()
+            return "created"
+        raise
 
 # ========= Parsing =========
 HOUR_RE = re.compile(r'(?P<h>\d{1,2})[:hH](?P<m>\d{2})')
@@ -154,10 +148,7 @@ def click_first_in_frames(page, selectors: List[str]) -> bool:
     return False
 
 def accept_cookies_any(page):
-    texts = [
-        "Tout accepter","Accepter tout","J'accepte","Accepter",
-        "OK","Continuer","J’ai compris","J'ai compris"
-    ]
+    texts = ["Tout accepter","Accepter tout","J'accepte","Accepter","OK","Continuer","J’ai compris","J'ai compris"]
     sels = [f'button:has-text("{t}")' for t in texts] + [f'role=button[name="{t}"]' for t in texts]
     click_first_in_frames(page, sels)
 
@@ -231,6 +222,7 @@ def click_text_anywhere(page, patterns: List[str]) -> bool:
     return False
 
 def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot_tag: str = "") -> bool:
+    """Clique un sélecteur CSS dans n’importe quel frame (facultatif)."""
     if not css:
         return False
     for fr in page.frames:
@@ -240,7 +232,12 @@ def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot
             loc = fr.locator(css)
             if loc.count() > 0:
                 loc.first.click()
-                page.wait_for_timeout(int(os.getenv("WAIT_AFTER_NAV_MS","800")))
+                page.wait_for_timeout(WAIT_AFTER_NAV_MS)
+                if screenshot_tag:
+                    try:
+                        page.screenshot(path=f"{SCREEN_DIR}/08-clicked-{screenshot_tag}.png", full_page=True)
+                    except:
+                        pass
                 return True
         except Exception as e:
             print(f"[NAV] click_css_in_frames fail in {fr.url}: {e}")
@@ -295,7 +292,6 @@ def login_ent(page):
 
     user_loc.fill(ENT_USER)
     pass_loc.fill(ENT_PASS)
-
     if not click_first_in_frames(page, submit_candidates):
         user_loc.press("Enter")
 
@@ -334,7 +330,7 @@ def goto_timetable(pronote_page):
     pronote_page.set_default_timeout(TIMEOUT_MS)
     accept_cookies_any(pronote_page)
 
-    # Chemin personnalisé "Vie scolaire" -> "Emploi du temps"
+    # Chemin manuel (facultatif) : Vie scolaire -> Emploi du temps
     if TIMETABLE_PRE_SELECTOR:
         click_css_in_frames(pronote_page, TIMETABLE_PRE_SELECTOR, TIMETABLE_FRAME, "pre-selector")
     if TIMETABLE_SELECTOR:
@@ -347,14 +343,38 @@ def goto_timetable(pronote_page):
             except TimeoutError:
                 pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-custom-timeout.png", full_page=True)
 
-    # Heuristique
+    # Déjà dessus ?
+    try:
+        fr = wait_timetable_any_frame(pronote_page, timeout_ms=10_000)
+        pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-already-here.png", full_page=True)
+        return fr
+    except TimeoutError:
+        pass
+
+    attempts = [
+        ["Emploi du temps", "Mon emploi du temps", "Emplois du temps"],
+        ["Planning", "Agenda"],
+        ["Vie scolaire", "Emploi du temps"],
+    ]
+    for i, pats in enumerate(attempts, 1):
+        for pat in pats:
+            if click_text_anywhere(pronote_page, [pat]):
+                accept_cookies_any(pronote_page)
+                try:
+                    fr = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
+                    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-ready-{i}-{pat}.png", full_page=True)
+                    return fr
+                except TimeoutError:
+                    pronote_page.screenshot(path=f"{SCREEN_DIR}/08-not-ready-{i}-{pat}.png", full_page=True)
+        pronote_page.wait_for_timeout(600)
+
     try:
         fr = wait_timetable_any_frame(pronote_page, timeout_ms=15_000)
-        pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-ready.png", full_page=True)
+        pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-ready-fallback.png", full_page=True)
         return fr
     except TimeoutError:
         pronote_page.screenshot(path=f"{SCREEN_DIR}/08-timetable-NOT-found.png", full_page=True)
-        raise RuntimeError("Impossible d’atteindre l’Emploi du temps.")
+        raise RuntimeError("Impossible d’atteindre l’Emploi du temps (après multiples essais).")
 
 def ensure_all_visible(page):
     if CLICK_TOUT_VOIR:
@@ -368,55 +388,95 @@ def goto_week_by_index(page, n: int) -> bool:
     ok = click_css_in_frames(page, css, TIMETABLE_FRAME, f"week-{n}")
     if ok:
         try:
-            wait_timetable_any_frame(page, timeout_ms=8_000)
+            wait_timetable_any_frame(page, timeout_ms=20_000)
         except TimeoutError:
             pass
     return ok
 
-def extract_week_info_from_target(target) -> Dict[str, Any]:
-    # 'target' is a Frame (preferred) or Page
-    header_text = ""
-    try:
-        header_text = target.evaluate("""() => (document.body.innerText || '').substring(0, 1500)""")
-    except:
-        header_text = ""
+def extract_week_info(pronote_page) -> Dict[str, Any]:
+    """
+    Récupère les tuiles de cours depuis le FRAME qui contient l'EDT.
+    On lit aussi le texte (du .. au ..) pour dater la semaine.
+    """
+    # 1) Trouver le frame de l'EDT
+    fr = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
 
-    d0 = monday_of_week(header_text)
-
-    tiles = target.evaluate(r"""
-    () => {
-      const out = [];
-      const add = (el, label) => {
-        if (!label) return;
-        let dayIndex = null, p = el;
-        while (p) {
-          if (p.getAttribute && p.getAttribute('data-dayindex')) { dayIndex = parseInt(p.getAttribute('data-dayindex')); break; }
-          p = p.parentElement;
-        }
-        out.push({ label, dayIndex });
-      };
-      const rx = /\d{1,2}[:hH]\d{2}.*\d{1,2}[:hH]\d{2}/;
-      document.querySelectorAll('[aria-label]').forEach(e => {
-        const v = e.getAttribute('aria-label'); if (v && rx.test(v)) add(e, v);
-      });
-      document.querySelectorAll('[title]').forEach(e => {
-        const v = e.getAttribute('title'); if (v && rx.test(v)) add(e, v);
-      });
-      document.querySelectorAll('*').forEach(e => {
-        const t = (e.innerText || '').trim();
-        if (t && rx.test(t) && t.length < 200) add(e, t);
-      });
-      return out;
-    }
+    # 2) Chercher le header (du 08/09/2025 au 12/09/2025) dans CE frame
+    header_text = fr.evaluate(r"""
+      () => {
+        const txt = (document.body.innerText || '').replace(/\s+/g,' ');
+        const m = txt.match(/du\s+\d{2}\/\d{2}\/\d{4}\s+au\s+\d{2}\/\d{2}\/\d{4}/i);
+        return m ? m[0] : '';
+      }
     """)
+
+    # 3) Extraire les "tiles" dans CE frame (aria-label, title ou innerText court)
+    tiles = fr.evaluate(r"""
+      () => {
+        const out = [];
+        const add = (el, label) => {
+          if (!label) return;
+          // essaie de retrouver le dayIndex en remontant
+          let dayIndex = null, p = el;
+          while (p) {
+            if (p.getAttribute && p.getAttribute('data-dayindex')) {
+              const v = parseInt(p.getAttribute('data-dayindex'));
+              if (!Number.isNaN(v)) { dayIndex = v; }
+              break;
+            }
+            p = p.parentElement;
+          }
+          out.push({ label, dayIndex });
+        };
+
+        // "de 8h05 à 9h00", "08:05 … 09:00", etc.
+        const rx = /(\d{1,2}\s*[h:]\s*\d{2}).{0,60}(\d{1,2}\s*[h:]\s*\d{2})/i;
+
+        // 3.1 aria-label / title
+        document.querySelectorAll('[aria-label],[title]').forEach(e => {
+          const v = e.getAttribute('aria-label') || e.getAttribute('title') || '';
+          if (rx.test(v)) add(e, v);
+        });
+
+        // 3.2 fallback innerText (évite les textes trop longs)
+        Array.from(document.querySelectorAll('body *')).forEach(e => {
+          const t = (e.innerText || '').trim();
+          if (t && t.length < 200 && rx.test(t)) add(e, t);
+        });
+
+        return out;
+      }
+    """)
+
+    # 4) Convertir la date de début de semaine
+    d0 = None
+    try:
+        m = re.search(r'(\d{2}/\d{2}/\d{4}).*?(\d{2}/\d{2}/\d{4})', header_text or '')
+        if m:
+            d0 = datetime.strptime(m.group(1), "%d/%m/%Y")
+    except Exception:
+        d0 = None
+
     return {"monday": d0, "tiles": tiles, "header": header_text}
+
+
+def iter_next_week(pronote_page) -> bool:
+    if click_first_in_frames(pronote_page, [
+        'button[title*="suivante"]','button[aria-label*="suivante"]','button:has-text("→")',
+        'a[title*="suivante"]','a:has-text("Semaine suivante")'
+    ]):
+        accept_cookies_any(pronote_page)
+        wait_for_timetable_ready(pronote_page)
+        pronote_page.screenshot(path=f"{SCREEN_DIR}/09-pronote-next-week.png", full_page=True)
+        return True
+    return False
 
 # ========= Main =========
 def run():
     if not ENT_USER or not ENT_PASS:
         raise SystemExit("Identifiants ENT manquants: PRONOTE_USER / PRONOTE_PASS.")
 
-    svc = gcal_service()
+    svc = get_gcal_service()
     created = updated = 0
 
     with sync_playwright() as p:
@@ -425,33 +485,26 @@ def run():
         page = context.new_page()
         page.set_default_timeout(TIMEOUT_MS)
 
+        # ENT → PRONOTE → Emploi du temps
         login_ent(page)
         pronote = open_pronote(context, page)
-        target = goto_timetable(pronote)  # Frame cible, sinon page
+        goto_timetable(pronote)
 
+        # Parcours des semaines (onglets j_n si fournis, sinon reste sur la semaine courante)
         start_idx = max(1, FETCH_WEEKS_FROM)
         end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
-        print(f"[CFG] Weeks: {start_idx}..{end_idx}")
 
         for week_idx in range(start_idx, end_idx + 1):
             used_tab = goto_week_by_index(pronote, week_idx)
             accept_cookies_any(pronote)
             ensure_all_visible(pronote)
 
-            # Re-detect target after navigation
-            try:
-                target = wait_timetable_any_frame(pronote, timeout_ms=10_000)
-            except:
-                target = pronote
-
-            info  = extract_week_info_from_target(target)
+            info  = extract_week_info(pronote)
             d0    = info["monday"]
             tiles = info["tiles"] or []
-            hdr   = (info.get("header") or "").replace("\n", " ")[:200]
-            print(f"Semaine {week_idx}: {len(tiles)} cours, header='{hdr}'")
+            hdr   = (info.get("header") or "").replace("\n", " ")[:120]
+            print(f"Semaine {week_idx}: {len(tiles)} cases, header='{hdr}'")
 
-            # Construire événements
-            entries = []
             for t in tiles:
                 label = (t.get("label") or "").strip()
                 if not label:
@@ -467,54 +520,44 @@ def run():
                 if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=90)):
                     continue
 
-                title = f"{TITLE_PREFIX}{(parsed['summary'] or 'Cours').strip()}"
-                room  = parsed["room"]
+                title    = f"{TITLE_PREFIX}{(parsed['summary'] or 'Cours').strip()}"
+                event_id = make_event_id(start_dt, end_dt, title, parsed["room"])
 
-                entries.append((start_dt, end_dt, title, room))
-
-            print(f"[DBG]   entries construits: {len(entries)}")
-
-            # Dédup pures (même tranche exacte) - côté script
-            by_key = {}
-            for (s,e,tit,rm) in entries:
-                k = (s.isoformat(), e.isoformat(), _norm(tit), _norm(rm))
-                by_key[k] = (s,e,tit,rm)
-            merged = list(by_key.values())
-            print(f"[DBG]   après dédup: {len(merged)}")
-
-            # Upsert côté Google
-            for (start_dt, end_dt, title, room) in merged:
-                h = make_hash_id(start_dt, end_dt, title, room)
-                body = {
+                event = {
                     "summary": title,
-                    "location": room,
+                    "location": parsed["room"],
                     "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Paris"},
                     "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "Europe/Paris"},
                     "colorId": COLOR_ID,
-                    "extendedProperties": {"private": {"mo_hash": h, "source": "pronote_playwright"}},
+                    "extendedProperties": {"private": {"source": "pronote_playwright"}},
                 }
+
                 try:
-                    action = upsert_event_by_hash(svc, CALENDAR_ID, h, body)
-                    if action == "created": created += 1
-                    else: updated += 1
+                    action = upsert_event_by_id(svc, CALENDAR_ID, event_id, event)
+                    if action == "created":
+                        created += 1
+                    else:
+                        updated += 1
                 except HttpError as e:
                     print(f"[GCAL] {e}")
+
+            # fallback si pas d’onglet semaine
+            if not used_tab and week_idx < end_idx:
+                if not iter_next_week(pronote):
+                    break
 
         browser.close()
 
     print(f"Terminé. créés={created}, maj={updated}")
 
+# --- ENTRYPOINT ---
 if __name__ == "__main__":
     try:
         run()
     except Exception as ex:
         try:
             os.makedirs(SCREEN_DIR, exist_ok=True)
-        except: pass
+        except:
+            pass
         print(f"[FATAL] {ex}")
         sys.exit(1)
-
-
-
-if __name__=="__main__":
-    run()
