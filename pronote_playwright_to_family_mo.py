@@ -406,29 +406,21 @@ def goto_week_by_index(page, n: int) -> bool:
 
 # ===================== Extraction =====================
 def _list_course_ids(ctx) -> List[str]:
-    """Récupère la liste des ids de coursInt (prioritaires) sinon cont*, dédoublonnée et ordonnée verticalement."""
-    ids = ctx.evaluate(r"""() => {
-      const pos = (e) => (e?.getBoundingClientRect()?.top || 9e9);
-      const cours = Array.from(document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')).map(e=>({id:e.id, top:pos(e)}));
-      let uniq = {};
-      for (const c of cours) uniq[c.id] = c.top;
-      // fallback: certains affichages ne mettent pas _coursInt_ partout, on prend _cont*
-      const conts = Array.from(document.querySelectorAll('[id^="id_"][id*="_cont"]')).map(e=>({id:e.id, top:pos(e)}));
-      for (const c of conts) uniq[c.id] = min = Math.min(uniq.get(c.id, 9e9) if (typeof uniq.get === 'function') else (uniq.get(c.id) if 'get' in uniq else uniq.get(c.id) if hasattr(uniq,'get') else 9e9), c.top) if False else (uniq[c.id] if c.id in uniq else 9e9)
-      return Object.entries(uniq).sort((a,b)=>a[1]-b[1]).map(x=>x[0]);
-    }""")
-    # La ligne ci-dessus ne peut pas exécuter de Python; on s'assure côté JS uniquement.
-    ids = ctx.evaluate(r"""() => {
-      const pos = (e) => (e?.getBoundingClientRect()?.top || 9e9);
-      const uniq = {};
-      for (const e of document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')) uniq[e.id] = pos(e);
-      for (const e of document.querySelectorAll('[id^="id_"][id*="_cont"]')) {
-        const t = pos(e);
-        uniq[e.id] = Math.min(uniq[e.id] ?? t, t);
-      }
-      return Object.entries(uniq).sort((a,b)=>a[1]-b[1]).map(x=>x[0]);
-    }""")
-    return ids or []
+    """IDs de cours (_coursInt_) et de contenus (_cont*), dédoublonnés et ordonnés verticalement."""
+    try:
+        ids = ctx.evaluate(r"""() => {
+          const pos = (e) => (e?.getBoundingClientRect()?.top || 9e9);
+          const uniq = {};
+          for (const e of document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')) uniq[e.id] = pos(e);
+          for (const e of document.querySelectorAll('[id^="id_"][id*="_cont"]')) {
+            const t = pos(e);
+            uniq[e.id] = Math.min(uniq[e.id] ?? t, t);
+          }
+          return Object.entries(uniq).sort((a,b)=>a[1]-b[1]).map(x=>x[0]);
+        }""")
+        return ids or []
+    except Exception:
+        return []
 
 def _click_by_id(ctx, el_id: str) -> bool:
     return ctx.evaluate("""(id)=>{
@@ -445,7 +437,6 @@ def _click_by_id(ctx, el_id: str) -> bool:
     }""", el_id)
 
 def _read_visible_panel(ctx) -> Optional[Dict[str, Any]]:
-    # Ne filtre pas par offsetParent (panneaux en position:fixed)
     for _ in range(PANEL_RETRIES):
         panel = ctx.evaluate(r"""() => {
           const panels = Array.from(document.querySelectorAll('.ConteneurCours'));
@@ -465,7 +456,6 @@ def _read_visible_panel(ctx) -> Optional[Dict[str, Any]]:
     return None
 
 def _collect_pairs_by_proximity(ctx) -> List[Dict[str, str]]:
-    # Associe coursInt et cont par proximité verticale au sein de la même base id_xxx_
     return ctx.evaluate(r"""() => {
       const cours = Array.from(document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')).map(e=>({id:e.id, r:e.getBoundingClientRect()}));
       const conts = Array.from(document.querySelectorAll('[id^="id_"][id*="_cont"]')).map(e=>({id:e.id, r:e.getBoundingClientRect(), text:(e.innerText||'').replace(/\s+/g,' ').trim()}));
@@ -511,7 +501,6 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
     tiles: List[Dict[str, Any]] = []
     year = (monday.year if monday else datetime.now().year)
 
-    # Comptages pour debug/transparence
     counts = {}
     for sel in ['[id^="id_"][id*="_coursInt_"] table','[id^="id_"][id*="_coursInt_"]','[id^="id_"][id*="_cont"]']:
         try:
@@ -521,7 +510,6 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         counts[sel] = int(c or 0)
     _safe_write(f"{SCREEN_DIR}/edp_selector_counts.json", json.dumps(counts, ensure_ascii=False, indent=2))
 
-    # -------- Clic 1x par ID unique --------
     click_log = []
     ids = _list_course_ids(ctx)
     lim = min(len(ids), MAX_TILES_PER_WEEK)
@@ -546,7 +534,6 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
             "start_dt": parsed["start_dt"],
             "end_dt": parsed["end_dt"]
         })
-        # fermer l'overlay si présent
         try: ctx.evaluate("()=>document.body.click()")
         except Exception: pass
         if len(tiles) >= MAX_TILES_PER_WEEK:
@@ -554,7 +541,6 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
 
     _safe_write(f"{SCREEN_DIR}/edp_click_log.json", json.dumps(click_log, ensure_ascii=False, indent=2))
 
-    # Fallback A: lire tous les panneaux déjà ouverts (sans cliquer)
     if not tiles:
         panels = ctx.evaluate(r"""() => {
           const list = [];
@@ -585,7 +571,6 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
             if len(tiles) >= MAX_TILES_PER_WEEK:
                 break
 
-    # Fallback B: appariement par proximité + inférence du jour (lundi→dimanche)
     if not tiles:
         pairs = _collect_pairs_by_proximity(ctx)
         _safe_write(f"{SCREEN_DIR}/edp_pairs_preview.json", json.dumps(pairs[:15], ensure_ascii=False, indent=2))
@@ -595,7 +580,6 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
             times = parse_times(aria)
             if not (times["start"] or times["end"]):
                 continue
-            # Résolution date: dd/mm explicite, sinon inférence par jour + 'monday'
             dt_date = parse_date_from_text(aria, fallback_year=year)
             if not dt_date and monday:
                 text_l = (aria or '').lower()
@@ -644,7 +628,6 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
     _safe_write(f"{SCREEN_DIR}/edp_debug_summary.json", json.dumps({
         "header": header_text, 
         "monday": monday.isoformat() if monday else None,
-        "click_ids": ids[:lim],
         "total_tiles": len(tiles)
     }, ensure_ascii=False, indent=2))
 
