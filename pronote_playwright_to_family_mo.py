@@ -36,7 +36,7 @@ WAIT_AFTER_NAV_MS      = int(os.getenv("WAIT_AFTER_NAV_MS", "1000"))
 
 # Bornes anti-hang
 MAX_TILES_PER_WEEK     = int(os.getenv("MAX_TILES_PER_WEEK", "120"))
-MAX_CLICK_PER_SELECTOR = int(os.getenv("MAX_CLICK_PER_SELECTOR", "120"))
+MAX_CLICK_PER_SELECTOR = int(os.getenv("MAX_CLICK_PER_SELECTOR", "120"))  # compat
 WEEK_HARD_TIMEOUT_MS   = int(os.getenv("WEEK_HARD_TIMEOUT_MS", "120000"))
 PANEL_WAIT_MS          = int(os.getenv("PANEL_WAIT_MS", "350"))
 PANEL_RETRIES          = int(os.getenv("PANEL_RETRIES", "8"))  # ~2.8s par clic
@@ -101,7 +101,7 @@ def get_gcal_service():
 
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode()
-    return re.sub(r"\\s+"," ",s).strip().lower()
+    return re.sub(r"\s+"," ",s).strip().lower()
 
 def make_event_id(start: datetime, end: datetime, title: str, location: str) -> str:
     key = f"{start.isoformat()}|{end.isoformat()}|{_norm(title)}|{_norm(location)}"
@@ -121,14 +121,15 @@ def upsert_event_by_id(svc, cal_id: str, event_id: str, body: Dict[str, Any]) ->
 
 # ===================== Parsing =====================
 H_PATTERNS = [
-    re.compile(r'(?P<h>\\d{1,2})\\s*[hH:]\\s*(?P<m>\\d{2})'),
-    re.compile(r'(?P<h>\\d{1,2})\\s*(?:heures?|hrs?)\\s*(?P<m>\\d{2})', re.IGNORECASE)
+    re.compile(r'(?P<h>\d{1,2})\s*[hH:]\s*(?P<m>\d{2})'),
+    re.compile(r'(?P<h>\d{1,2})\s*(?:heures?|hrs?)\s*(?P<m>\d{2})', re.IGNORECASE)
 ]
-DURATION_RE = re.compile(r'(?P<dh>\\d{1,2})\\s*[hH]\\s*(?P<dm>\\d{2})')
+DURATION_RE = re.compile(r'(?P<dh>\d{1,2})\s*[hH]\s*(?P<dm>\d{2})')
 
 def parse_times(text: str) -> Dict[str, Optional[tuple[int,int]]]:
     """Supporte: 
     - '08h05 - 09h00'  -> start/end
+    - 'de 8 heures 05 à 9 heures 00' -> start/end
     - '1h00 - vendredi 26/09 à 11h15' -> durée + début
     """
     t = (text or "").strip()
@@ -138,7 +139,7 @@ def parse_times(text: str) -> Dict[str, Optional[tuple[int,int]]]:
             hours.append((int(m.group("h")), int(m.group("m"))))
 
     # Cas PRONOTE classique: "durée - ... à HH:MM" + date dd/mm quelque part
-    if 'à' in t and re.search(r'\\d{1,2}\\s*/\\s*\\d{1,2}', t) and len(hours) == 2:
+    if 'à' in t and re.search(r'\d{1,2}\s*/\s*\d{1,2}', t) and len(hours) == 2:
         return {"start": hours[1], "end": None, "duration": hours[0]}
 
     if len(hours) >= 2:
@@ -155,12 +156,12 @@ MONTHS_FR = {
 }
 
 def parse_date_from_text(text: str, fallback_year: int) -> Optional[datetime]:
-    m = re.search(r'(\\d{1,2})\\s*/\\s*(\\d{1,2})(?:\\s*/\\s*(\\d{4}))?', text or '')
+    m = re.search(r'(\d{1,2})\s*/\s*(\d{1,2})(?:\s*/\s*(\d{4}))?', text or '')
     if m:
         d, mo = int(m.group(1)), int(m.group(2))
         y = int(m.group(3)) if m.group(3) else fallback_year
         return datetime(y, mo, d)
-    m = re.search(r'(\\d{1,2})\\s+([A-Za-zéûùôîïàâç]+)', text or '', re.IGNORECASE)
+    m = re.search(r'(\d{1,2})\s+([A-Za-zéûùôîïàâç]+)', text or '', re.IGNORECASE)
     if m:
         d = int(m.group(1)); mo_name = m.group(2).lower()
         mo = MONTHS_FR.get(mo_name)
@@ -173,8 +174,8 @@ def to_dt(date_base: datetime, hm: tuple[int,int]) -> datetime:
 
 def parse_panel(panel: Dict[str, Any], year: int) -> Optional[Dict[str, Any]]:
     header = panel.get("header","")
-    matiere = re.sub(r'\\s+', ' ', (panel.get("matiere","") or "").strip())
-    salle   = re.sub(r'\\s+', ' ', (panel.get("salle","") or "").strip())
+    matiere = re.sub(r'\s+', ' ', (panel.get("matiere","") or "").strip())
+    salle   = re.sub(r'\s+', ' ', (panel.get("salle","") or "").strip())
     times = parse_times(header)  # peut retourner durée
     if not (times["start"] or times["end"]):
         return None
@@ -193,7 +194,7 @@ def parse_panel(panel: Dict[str, Any], year: int) -> Optional[Dict[str, Any]]:
         return None
     summary = matiere or "Cours"
     if not salle:
-        m = re.search(r'(?:Salle[s]?\\s+)(.+)$', header, re.IGNORECASE)
+        m = re.search(r'(?:Salle[s]?\s+)(.+)$', header, re.IGNORECASE)
         if m: salle = m.group(1).strip()
     return {"summary": summary, "room": salle, "start_dt": start_dt, "end_dt": end_dt}
 
@@ -404,23 +405,44 @@ def goto_week_by_index(page, n: int) -> bool:
     return ok
 
 # ===================== Extraction =====================
-CANDIDATE_SELECTORS = [
-    '[id^="id_"][id*="_coursInt_"] table',
-    '[id^="id_"][id*="_coursInt_"]',
-    '[id^="id_"][id*="_cont"]',
-]
+def _list_course_ids(ctx) -> List[str]:
+    """Récupère la liste des ids de coursInt (prioritaires) sinon cont*, dédoublonnée et ordonnée verticalement."""
+    ids = ctx.evaluate(r"""() => {
+      const pos = (e) => (e?.getBoundingClientRect()?.top || 9e9);
+      const cours = Array.from(document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')).map(e=>({id:e.id, top:pos(e)}));
+      let uniq = {};
+      for (const c of cours) uniq[c.id] = c.top;
+      // fallback: certains affichages ne mettent pas _coursInt_ partout, on prend _cont*
+      const conts = Array.from(document.querySelectorAll('[id^="id_"][id*="_cont"]')).map(e=>({id:e.id, top:pos(e)}));
+      for (const c of conts) uniq[c.id] = min = Math.min(uniq.get(c.id, 9e9) if (typeof uniq.get === 'function') else (uniq.get(c.id) if 'get' in uniq else uniq.get(c.id) if hasattr(uniq,'get') else 9e9), c.top) if False else (uniq[c.id] if c.id in uniq else 9e9)
+      return Object.entries(uniq).sort((a,b)=>a[1]-b[1]).map(x=>x[0]);
+    }""")
+    # La ligne ci-dessus ne peut pas exécuter de Python; on s'assure côté JS uniquement.
+    ids = ctx.evaluate(r"""() => {
+      const pos = (e) => (e?.getBoundingClientRect()?.top || 9e9);
+      const uniq = {};
+      for (const e of document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')) uniq[e.id] = pos(e);
+      for (const e of document.querySelectorAll('[id^="id_"][id*="_cont"]')) {
+        const t = pos(e);
+        uniq[e.id] = Math.min(uniq[e.id] ?? t, t);
+      }
+      return Object.entries(uniq).sort((a,b)=>a[1]-b[1]).map(x=>x[0]);
+    }""")
+    return ids or []
 
-def _click_candidate(ctx, sel: str, idx: int) -> bool:
-    return ctx.evaluate("""(p)=>{
-      const sel=p.sel, i=p.i;
-      const els = Array.from(document.querySelectorAll(sel));
-      const el = els[i];
+def _click_by_id(ctx, el_id: str) -> bool:
+    return ctx.evaluate("""(id)=>{
+      const el = document.getElementById(id);
       if(!el) return false;
       el.scrollIntoView({block:'center'});
       try { el.click(); } catch(e) {}
-      try { el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true})); el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true})); el.dispatchEvent(new MouseEvent('click',{bubbles:true})); } catch(e){}
+      try {
+        el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));
+        el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));
+        el.dispatchEvent(new MouseEvent('click',{bubbles:true}));
+      } catch(e){}
       return true;
-    }""", {"sel": sel, "i": idx})
+    }""", el_id)
 
 def _read_visible_panel(ctx) -> Optional[Dict[str, Any]]:
     # Ne filtre pas par offsetParent (panneaux en position:fixed)
@@ -491,7 +513,7 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
 
     # Comptages pour debug/transparence
     counts = {}
-    for sel in CANDIDATE_SELECTORS:
+    for sel in ['[id^="id_"][id*="_coursInt_"] table','[id^="id_"][id*="_coursInt_"]','[id^="id_"][id*="_cont"]']:
         try:
             c = ctx.evaluate("(s)=>document.querySelectorAll(s).length", sel)
         except Exception:
@@ -499,33 +521,38 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         counts[sel] = int(c or 0)
     _safe_write(f"{SCREEN_DIR}/edp_selector_counts.json", json.dumps(counts, ensure_ascii=False, indent=2))
 
-    parsed_by_click = 0
-    for sel in CANDIDATE_SELECTORS:
-        n = counts.get(sel, 0)
-        lim = min(n, MAX_CLICK_PER_SELECTOR, MAX_TILES_PER_WEEK - len(tiles))
-        for i in range(lim):
-            if not _click_candidate(ctx, sel, i):
-                continue
-            panel = _read_visible_panel(ctx)
-            if not panel:
-                continue
-            parsed = parse_panel(panel, year)
-            if not parsed:
-                continue
-            tiles.append({
-                "label": f"{parsed['summary']} — {panel.get('header','')}",
-                "summary": parsed["summary"],
-                "room": parsed["room"],
-                "start_dt": parsed["start_dt"],
-                "end_dt": parsed["end_dt"]
-            })
-            parsed_by_click += 1
-            try: ctx.evaluate("()=>document.body.click()")
-            except Exception: pass
-            if len(tiles) >= MAX_TILES_PER_WEEK:
-                break
+    # -------- Clic 1x par ID unique --------
+    click_log = []
+    ids = _list_course_ids(ctx)
+    lim = min(len(ids), MAX_TILES_PER_WEEK)
+    for i in range(lim):
+        el_id = ids[i]
+        ok = _click_by_id(ctx, el_id)
+        if not ok:
+            click_log.append({"id": el_id, "clicked": False})
+            continue
+        panel = _read_visible_panel(ctx)
+        if not panel:
+            click_log.append({"id": el_id, "clicked": True, "panel": None})
+            continue
+        parsed = parse_panel(panel, year)
+        click_log.append({"id": el_id, "clicked": True, "panel_header": panel.get("header",""), "parsed_ok": bool(parsed)})
+        if not parsed:
+            continue
+        tiles.append({
+            "label": f"{parsed['summary']} — {panel.get('header','')}",
+            "summary": parsed["summary"],
+            "room": parsed["room"],
+            "start_dt": parsed["start_dt"],
+            "end_dt": parsed["end_dt"]
+        })
+        # fermer l'overlay si présent
+        try: ctx.evaluate("()=>document.body.click()")
+        except Exception: pass
         if len(tiles) >= MAX_TILES_PER_WEEK:
             break
+
+    _safe_write(f"{SCREEN_DIR}/edp_click_log.json", json.dumps(click_log, ensure_ascii=False, indent=2))
 
     # Fallback A: lire tous les panneaux déjà ouverts (sans cliquer)
     if not tiles:
@@ -561,7 +588,7 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
     # Fallback B: appariement par proximité + inférence du jour (lundi→dimanche)
     if not tiles:
         pairs = _collect_pairs_by_proximity(ctx)
-        _safe_write(f"{SCREEN_DIR}/edp_pairs_preview.json", json.dumps(pairs[:10], ensure_ascii=False, indent=2))
+        _safe_write(f"{SCREEN_DIR}/edp_pairs_preview.json", json.dumps(pairs[:15], ensure_ascii=False, indent=2))
         for t in pairs:
             aria = t.get("aria","")
             cont = t.get("cont","")
@@ -589,9 +616,9 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
                 end_dt   = start_dt + timedelta(hours=dh, minutes=dm)
             else:
                 continue
-            summary = (re.sub(r'\\s+',' ', cont).strip() or "Cours")
+            summary = (re.sub(r'\s+',' ', cont).strip() or "Cours")
             room = ""
-            m = re.search(r'(?:Salle[s]?\\s+)(.+)$', cont, re.IGNORECASE)
+            m = re.search(r'(?:Salle[s]?\s+)(.+)$', cont, re.IGNORECASE)
             if m: room = m.group(1).strip()
             tiles.append({
                 "label": f"{summary} — {aria}",
@@ -615,8 +642,10 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         _safe_write(f"{SCREEN_DIR}/edp_candidates.json", json.dumps(ids_dump, ensure_ascii=False, indent=2))
 
     _safe_write(f"{SCREEN_DIR}/edp_debug_summary.json", json.dumps({
-        "header": header_text, "monday": monday.isoformat() if monday else None,
-        "found_by_click": parsed_by_click, "total_tiles": len(tiles)
+        "header": header_text, 
+        "monday": monday.isoformat() if monday else None,
+        "click_ids": ids[:lim],
+        "total_tiles": len(tiles)
     }, ensure_ascii=False, indent=2))
 
     return {"monday": monday, "tiles": tiles, "header": header_text}
@@ -677,7 +706,7 @@ def run() -> None:
                 except HttpError as e:
                     log(f"[GCAL] {e}")
 
-            if not used_tab and week_idx < end_idx:
+            if week_idx < end_idx:
                 clicked = click_first_any(pronote, [
                     'button[title*="suivante"]','button[aria-label*="suivante"]','a:has-text("Semaine suivante")'
                 ])
