@@ -315,7 +315,8 @@ def login_ent(page) -> None:
 def open_pronote(context, page):
     page.set_default_timeout(TIMEOUT_MS)
     if PRONOTE_URL:
-        page.goto(PRONOTE_URL, wait_until="load")
+        page.goto(PRONOTE_URL)
+        page.wait_for_load_state("load")
         page.wait_for_load_state("domcontentloaded")
         accept_cookies_any(page)
         _safe_shot(page, "06-pronote-direct")
