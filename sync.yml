@@ -1,0 +1,58 @@
+name: pronote-to-family-mo (Playwright)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '5 6,16 * * *'   # 06:05 et 16:05 UTC
+
+jobs:
+  sync:
+    runs-on: [self-hosted, Windows]
+
+    defaults:
+      run:
+        shell: powershell
+
+    env:
+      PRONOTE_USER:        ${{ secrets.PRONOTE_USER }}
+      PRONOTE_PASS:        ${{ secrets.PRONOTE_PASS }}
+      CALENDAR_ID:         'family15066434840617961429@group.calendar.google.com'
+      ENT_URL:             'https://ent77.seine-et-marne.fr/welcome'
+      PRONOTE_URL:         'https://0771342r.index-education.net/pronote/parent.html'
+      HEADFUL:             '1'
+
+      # ⚠️ Les # et [] doivent ABSOLUMENT être quotés
+      TIMETABLE_PRE_SELECTOR: '#GInterface\.Instances\[0\]\.Instances\[1\]_Combo5'
+      TIMETABLE_SELECTOR:     '#GInterface\.Instances\[0\]\.Instances\[1\]_Liste_niveau5 > ul > li:nth-child(1) > div > div'
+      TIMETABLE_FRAME:        'parent.html'
+      WEEK_TAB_TEMPLATE:      '#GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}'
+      FETCH_WEEKS_FROM:       '1'
+      WEEKS_TO_FETCH:         '4'
+      WAIT_AFTER_NAV_MS:      '1000'
+      CLICK_TOUT_VOIR:        '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: 'x64'
+
+      - name: Jitter aléatoire (30–120s)
+        run: Start-Sleep -Seconds (Get-Random -Minimum 30 -Maximum 120)
+
+      - name: Créer dossier screenshots
+        run: New-Item -ItemType Directory -Force -Path screenshots | Out-Null
+
+      - name: Lancer l’orchestrateur
+        run: |
+          & "$env:pythonLocation\python.exe" .\sync.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/**
+          if-no-files-found: ignore
