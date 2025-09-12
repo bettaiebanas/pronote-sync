@@ -3,7 +3,7 @@ name: pronote-to-family-mo (Playwright)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '5 6,16 * * *'   # 06:05 et 16:05 UTC
+    - cron: '5 6,16 * * *'   # 06:05 et 16:05 UTC ≈ 08:05/18:05 Paris
 
 jobs:
   sync:
@@ -14,22 +14,33 @@ jobs:
         shell: powershell
 
     env:
-      PRONOTE_USER:        ${{ secrets.PRONOTE_USER }}
-      PRONOTE_PASS:        ${{ secrets.PRONOTE_PASS }}
-      CALENDAR_ID:         'family15066434840617961429@group.calendar.google.com'
-      ENT_URL:             'https://ent77.seine-et-marne.fr/welcome'
-      PRONOTE_URL:         'https://0771342r.index-education.net/pronote/parent.html'
-      HEADFUL:             '1'
+      # Identifiants ENT (déjà dans tes secrets)
+      PRONOTE_USER: ${{ secrets.PRONOTE_USER }}
+      PRONOTE_PASS: ${{ secrets.PRONOTE_PASS }}
 
-      # ⚠️ Les # et [] doivent ABSOLUMENT être quotés
+      # Cible Google Calendar (laisse tel quel si c'est bien le calendrier Famille)
+      CALENDAR_ID:  family15066434840617961429@group.calendar.google.com
+
+      # URLs ENT/PRONOTE (tes valeurs)
+      ENT_URL:      https://ent77.seine-et-marne.fr/welcome
+      PRONOTE_URL:  https://0771342r.index-education.net/pronote/parent.html
+
+      # Voir le navigateur (HEADFUL=1 sur self-hosted)
+      HEADFUL:      "1"
+
+      # Sélecteurs relevés sur ton instance PRONOTE
       TIMETABLE_PRE_SELECTOR: '#GInterface\.Instances\[0\]\.Instances\[1\]_Combo5'
       TIMETABLE_SELECTOR:     '#GInterface\.Instances\[0\]\.Instances\[1\]_Liste_niveau5 > ul > li:nth-child(1) > div > div'
       TIMETABLE_FRAME:        'parent.html'
-      WEEK_TAB_TEMPLATE:      '#GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}'
-      FETCH_WEEKS_FROM:       '1'
-      WEEKS_TO_FETCH:         '4'
-      WAIT_AFTER_NAV_MS:      '1000'
-      CLICK_TOUT_VOIR:        '1'
+
+      # Onglets semaines j_1, j_2, j_3…
+      WEEK_TAB_TEMPLATE: '#GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}'
+      FETCH_WEEKS_FROM: '1'
+      WEEKS_TO_FETCH:   '4'
+
+      # Divers
+      WAIT_AFTER_NAV_MS: '1000'
+      CLICK_TOUT_VOIR:   '1'
 
     steps:
       - uses: actions/checkout@v4
@@ -39,20 +50,45 @@ jobs:
           python-version: '3.12'
           architecture: 'x64'
 
-      - name: Jitter aléatoire (30–120s)
-        run: Start-Sleep -Seconds (Get-Random -Minimum 30 -Maximum 120)
+      - name: Jitter aléatoire (30s–5min)
+        run: Start-Sleep -Seconds (Get-Random -Minimum 30 -Maximum 300)
 
+      - name: IP publique du job
+        run: |
+          try {
+            $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
+            Write-Host "IP publique du job: $ip"
+          } catch {
+            Write-Host "IP non récupérée: $($_.Exception.Message)"
+          }
+      - name: Recréer OAuth Google (depuis secrets)
+        run: |
+          Set-Content -Path credentials.json -Value '${{ secrets.GCAL_CLIENT_SECRET }}' -NoNewline
+          Set-Content -Path token.json        -Value '${{ secrets.GCAL_TOKEN_JSON }}'  -NoNewline
+      - name: Bootstrap pip (toolcache Windows)
+        run: |
+          & "$env:pythonLocation\python.exe" -V
+          & "$env:pythonLocation\python.exe" -m ensurepip --upgrade
+          & "$env:pythonLocation\python.exe" -m pip --version
+          & "$env:pythonLocation\python.exe" -m pip install --upgrade pip setuptools wheel
+      - name: Installer dépendances Python
+        run: |
+          & "$env:pythonLocation\python.exe" -m pip install playwright google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
+      - name: Installer Chromium (Playwright)
+        run: |
+          & "$env:pythonLocation\python.exe" -m playwright install chromium
       - name: Créer dossier screenshots
         run: New-Item -ItemType Directory -Force -Path screenshots | Out-Null
 
-      - name: Lancer l’orchestrateur
+      - name: Lancer la synchro Playwright -> Google Calendar
         run: |
-          & "$env:pythonLocation\python.exe" .\sync.py
-
-      - name: Upload screenshots
+          & "$env:pythonLocation\python.exe" .\pronote_playwright_to_family_mo.py
+      - name: Upload artefacts (captures + dumps DOM)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshots
-          path: screenshots/**
+          path: |
+            screenshots/**
+            dom-*.html
           if-no-files-found: ignore
