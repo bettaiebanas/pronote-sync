@@ -31,7 +31,6 @@ HEADFUL       = os.getenv("HEADFUL", "0") == "1"
 TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
 TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
 TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
-# IMPORTANT : template donné par l'utilisateur (ex: '#GInterface\\.Instances\\[2\\]\\.Instances\\[0\\]_j_{n}')
 WEEK_TAB_TEMPLATE      = os.getenv("WEEK_TAB_TEMPLATE", "#GInterface\\.Instances\\[2\\]\\.Instances\\[0\\]_j_{n}").strip()
 
 FETCH_WEEKS_FROM       = int(os.getenv("FETCH_WEEKS_FROM", "1"))
@@ -47,10 +46,24 @@ TIMEZONE         = "Europe/Paris"
 TIMEOUT_MS  = 120_000
 SCREEN_DIR  = "screenshots"
 
+# ===================== IO-safe console =====================
+try:
+    # Force UTF-8 console where supported to avoid 'charmap' errors on Windows runners
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # ===================== Utils =====================
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+    line = f"[{ts}] {msg}"
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        # Fallback ASCII
+        safe = (line.encode("ascii", "replace")).decode("ascii")
+        print(safe)
 
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
@@ -149,7 +162,6 @@ def to_datetime(base_monday: Optional[datetime], day_idx: Optional[int], hm: tup
 
 # ===================== Playwright helpers =====================
 def _iter_contexts(page):
-    # >>> BUG FIX: inclure la page principale en plus des frames
     yield page
     for fr in page.frames:
         yield fr
@@ -174,7 +186,6 @@ def click_first_any(page, selectors: List[str]) -> bool:
         return True
     except Exception:
         try:
-            # fallback: click via JS
             el = loc.element_handle()
             if el:
                 el.evaluate("(n)=>n.click()")
@@ -184,7 +195,7 @@ def click_first_any(page, selectors: List[str]) -> bool:
         return False
 
 def accept_cookies_any(page) -> None:
-    texts = ["Tout accepter","Accepter tout","J'accepte","Accepter","OK","Continuer","J’ai compris","J'ai compris"]
+    texts = ["Tout accepter","Accepter tout","J'accepte","Accepter","OK","Continuer","J'ai compris"]
     sels = [f'button:has-text(\"{t}\")' for t in texts] + [f'role=button[name=\"{t}\"]' for t in texts]
     click_first_any(page, sels)
 
@@ -413,7 +424,7 @@ def goto_timetable(pronote_page):
         return ctx
     except TimeoutError:
         _safe_shot(pronote_page, "08-timetable-NOT-found")
-        raise RuntimeError("Impossible d’atteindre l’Emploi du temps.")
+        raise RuntimeError("Impossible d'atteindre l'Emploi du temps.")
 
 def ensure_all_visible(page) -> None:
     if CLICK_TOUT_VOIR:
@@ -421,7 +432,6 @@ def ensure_all_visible(page) -> None:
         page.wait_for_timeout(400)
 
 def goto_week_by_index(page, n: int) -> bool:
-    # >>> FIX : clique sur l'onglet semaine au niveau page + frames
     if not WEEK_TAB_TEMPLATE:
         return False
     css = WEEK_TAB_TEMPLATE.format(n=n)
@@ -442,7 +452,6 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         return m ? m[0] : '';
       }
     """)
-    # 1) collecte standard via aria-label/title + texte court
     tiles = ctx.evaluate(r"""
       () => {
         const out = [];
@@ -471,7 +480,6 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         return out;
       }
     """)
-    # 2) Fallback spécifique PRONOTE via ids ex: #id_140_coursInt_0 > table, #id_140_cont40
     if not tiles or len(tiles) < 3:
         extra = ctx.evaluate(r"""
           () => {
@@ -501,7 +509,7 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
 
 def iter_next_week(pronote_page) -> bool:
     if click_first_any(pronote_page, [
-        'button[title*=\"suivante\"]','button[aria-label*=\"suivante\"]','button:has-text(\"→\")',
+        'button[title*=\"suivante\"]','button[aria-label*=\"suivante\"]','button:has-text(\">\")',
         'a[title*=\"suivante\"]','a:has-text(\"Semaine suivante\")'
     ]):
         accept_cookies_any(pronote_page)
@@ -523,18 +531,18 @@ def run() -> None:
         context = browser.new_context(locale="fr-FR", timezone_id=TIMEZONE)
         page = context.new_page(); page.set_default_timeout(TIMEOUT_MS)
 
-        log("Connexion ENT…")
+        log("Connexion ENT...")
         login_ent(page)
-        log("Ouverture PRONOTE…")
+        log("Ouverture PRONOTE...")
         pronote = open_pronote(context, page)
-        log("Navigation vers 'Emploi du temps'…")
+        log("Navigation vers 'Emploi du temps'...")
         goto_timetable(pronote)
 
         start_idx = max(1, FETCH_WEEKS_FROM)
         end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
 
         for week_idx in range(start_idx, end_idx + 1):
-            log(f"⇢ Sélection Semaine index={week_idx} via css '{WEEK_TAB_TEMPLATE.format(n=week_idx)}'")
+            log(f"-> Selection Semaine index={week_idx} via css '{WEEK_TAB_TEMPLATE.format(n=week_idx)}'")
             used_tab = goto_week_by_index(pronote, week_idx)
             accept_cookies_any(pronote)
             ensure_all_visible(pronote)
@@ -585,7 +593,7 @@ def run() -> None:
 
         browser.close()
 
-    log(f"Terminé. créés={created}, maj={updated}")
+    log(f"Termine. crees={created}, maj={updated}")
 
 if __name__ == "__main__":
     try:
