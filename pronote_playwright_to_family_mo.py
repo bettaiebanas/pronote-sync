@@ -17,6 +17,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# ===================== Variables d'env (inchangées) =====================
 ENT_URL       = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
 PRONOTE_URL   = os.getenv("PRONOTE_URL", "")
 ENT_USER      = os.getenv("PRONOTE_USER", "")
@@ -30,7 +31,9 @@ HEADFUL       = os.getenv("HEADFUL", "0") == "1"
 TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
 TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
 TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
-WEEK_TAB_TEMPLATE      = os.getenv("WEEK_TAB_TEMPLATE", "").strip()
+# IMPORTANT : template donné par l'utilisateur (ex: '#GInterface\\.Instances\\[2\\]\\.Instances\\[0\\]_j_{n}')
+WEEK_TAB_TEMPLATE      = os.getenv("WEEK_TAB_TEMPLATE", "#GInterface\\.Instances\\[2\\]\\.Instances\\[0\\]_j_{n}").strip()
+
 FETCH_WEEKS_FROM       = int(os.getenv("FETCH_WEEKS_FROM", "1"))
 WEEKS_TO_FETCH         = int(os.getenv("WEEKS_TO_FETCH", "4"))
 CLICK_TOUT_VOIR        = os.getenv("CLICK_TOUT_VOIR", "1") == "1"
@@ -44,13 +47,14 @@ TIMEZONE         = "Europe/Paris"
 TIMEOUT_MS  = 120_000
 SCREEN_DIR  = "screenshots"
 
+# ===================== Utils =====================
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}")
 
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
-    s = re.sub(r"\s+", " ", s).strip().lower()
+    s = re.sub(r"\\s+", " ", s).strip().lower()
     return s
 
 def make_event_id(start: datetime, end: datetime, title: str, location: str) -> str:
@@ -70,6 +74,7 @@ def _safe_shot(page, name: str) -> None:
     except Exception:
         pass
 
+# ===================== Google Calendar =====================
 def get_gcal_service():
     if not CALENDAR_ID:
         raise SystemExit("CALENDAR_ID manquant.")
@@ -105,7 +110,8 @@ def upsert_event_by_id(svc, cal_id: str, event_id: str, body: Dict[str, Any]) ->
             return "created"
         raise
 
-HOUR_RE = re.compile(r'(?P<h>\d{1,2})[:hH](?P<m>\d{2})')
+# ===================== Parsing =====================
+HOUR_RE = re.compile(r'(?P<h>\\d{1,2})[:hH](?P<m>\\d{2})')
 
 def parse_timespan(text: str):
     times = HOUR_RE.findall(text or "")
@@ -122,14 +128,14 @@ def parse_aria_label(label: str) -> Dict[str, Any]:
     if tspan:
         d["start"], d["end"] = tspan
 
-    m_room = re.search(r'(?:Salle|Salles?)\s*([A-Za-z0-9\-_. ]+)', lab, re.IGNORECASE)
+    m_room = re.search(r'(?:Salle|Salles?)\\s*([A-Za-z0-9\\-_. ]+)', lab, re.IGNORECASE)
     if m_room:
         d["room"] = m_room.group(1).strip()
 
     summary = lab
-    summary = re.sub(r'^\s*\d{1,2}[:hH]\d{2}\s*[–\-]\s*\d{1,2}[:hH]\d{2}\s*', '', summary)
+    summary = re.sub(r'^\\s*\\d{1,2}[:hH]\\d{2}\\s*[–\\-]\\s*\\d{1,2}[:hH]\\d{2}\\s*', '', summary)
     summary = re.sub(r'(Salle|Salles?).*$', '', summary, flags=re.IGNORECASE)
-    summary = re.sub(r'(Prof\.?:.*)$', '', summary, flags=re.IGNORECASE)
+    summary = re.sub(r'(Prof\\.?\\s?:.*)$', '', summary, flags=re.IGNORECASE)
     summary = summary.strip(" -–")
     d["summary"] = summary if summary else "Cours"
     return d
@@ -141,31 +147,46 @@ def to_datetime(base_monday: Optional[datetime], day_idx: Optional[int], hm: tup
         base = datetime.now()
     return base.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
 
-def first_locator_in_frames(page, selectors: List[str]):
-    for frame in page.frames:
+# ===================== Playwright helpers =====================
+def _iter_contexts(page):
+    # >>> BUG FIX: inclure la page principale en plus des frames
+    yield page
+    for fr in page.frames:
+        yield fr
+
+def first_locator_any(page, selectors: List[str]):
+    for ctx in _iter_contexts(page):
         for sel in selectors:
             try:
-                loc = frame.locator(sel)
+                loc = ctx.locator(sel)
                 if loc.count() > 0:
                     return loc.first
             except Exception:
                 continue
     return None
 
-def click_first_in_frames(page, selectors: List[str]) -> bool:
-    loc = first_locator_in_frames(page, selectors)
+def click_first_any(page, selectors: List[str]) -> bool:
+    loc = first_locator_any(page, selectors)
     if not loc:
         return False
     try:
         loc.click()
         return True
     except Exception:
+        try:
+            # fallback: click via JS
+            el = loc.element_handle()
+            if el:
+                el.evaluate("(n)=>n.click()")
+                return True
+        except Exception:
+            pass
         return False
 
 def accept_cookies_any(page) -> None:
     texts = ["Tout accepter","Accepter tout","J'accepte","Accepter","OK","Continuer","J’ai compris","J'ai compris"]
-    sels = [f'button:has-text("{t}")' for t in texts] + [f'role=button[name="{t}"]' for t in texts]
-    click_first_in_frames(page, sels)
+    sels = [f'button:has-text(\"{t}\")' for t in texts] + [f'role=button[name=\"{t}\"]' for t in texts]
+    click_first_any(page, sels)
 
 def _frame_has_timetable_js() -> str:
     return r"""
@@ -178,25 +199,25 @@ def _frame_has_timetable_js() -> str:
       }
     """
 
-def wait_timetable_any_frame(page, timeout_ms: int = TIMEOUT_MS):
+def wait_timetable_any(page, timeout_ms: int = TIMEOUT_MS):
     deadline = time.time() + timeout_ms/1000.0
     js = _frame_has_timetable_js()
     while time.time() < deadline:
-        for fr in page.frames:
+        for ctx in _iter_contexts(page):
             try:
-                if fr.evaluate(js):
-                    return fr
+                if ctx.evaluate(js):
+                    return ctx
             except Exception:
                 pass
         page.wait_for_timeout(300)
-    raise TimeoutError("Timetable not found in any frame")
+    raise TimeoutError("Timetable not found")
 
 def click_text_anywhere(page, patterns: List[str]) -> bool:
-    for frame in page.frames:
+    for ctx in _iter_contexts(page):
         for pat in patterns:
             for loc in [
-                frame.get_by_role("link", name=re.compile(pat, re.I)),
-                frame.get_by_role("button", name=re.compile(pat, re.I)),
+                ctx.get_by_role("link", name=re.compile(pat, re.I)),
+                ctx.get_by_role("button", name=re.compile(pat, re.I)),
             ]:
                 try:
                     if loc.count() > 0:
@@ -205,7 +226,7 @@ def click_text_anywhere(page, patterns: List[str]) -> bool:
                 except Exception:
                     pass
             try:
-                found = frame.evaluate(
+                found = ctx.evaluate(
                     r"""
                     (pat) => {
                       const rx = new RegExp(pat, 'i');
@@ -233,24 +254,37 @@ def click_text_anywhere(page, patterns: List[str]) -> bool:
                 pass
     return False
 
-def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot_tag: str = "") -> bool:
+def click_css_any(page, css: str, screenshot_tag: str = "") -> bool:
     if not css:
         return False
-    for fr in page.frames:
-        if frame_url_contains and frame_url_contains not in fr.url:
-            continue
+    for ctx in _iter_contexts(page):
         try:
-            loc = fr.locator(css)
+            loc = ctx.locator(css)
             if loc.count() > 0:
-                loc.first.click()
+                try:
+                    loc.first.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    loc.first.click()
+                except Exception:
+                    try:
+                        el = loc.first.element_handle()
+                        if el:
+                            el.evaluate("(n)=>n.click()")
+                        else:
+                            continue
+                    except Exception:
+                        continue
                 page.wait_for_timeout(WAIT_AFTER_NAV_MS)
                 if screenshot_tag:
                     _safe_shot(page, f"08-clicked-{screenshot_tag}")
                 return True
         except Exception as e:
-            log(f"[NAV] click_css_in_frames fail in {getattr(fr,'url','?')}: {e}")
+            log(f"[NAV] click_css_any fail: {e}")
     return False
 
+# ===================== Navigation =====================
 def login_ent(page) -> None:
     _safe_mkdir(SCREEN_DIR)
     page.set_default_timeout(TIMEOUT_MS)
@@ -259,39 +293,39 @@ def login_ent(page) -> None:
     accept_cookies_any(page)
     _safe_shot(page, "01-ent-welcome")
 
-    click_first_in_frames(page, [
-        'a:has-text("Se connecter")','a:has-text("Connexion")',
-        'button:has-text("Se connecter")','button:has-text("Connexion")',
-        'a[href*="login"]','a[href*="auth"]'
+    click_first_any(page, [
+        'a:has-text(\"Se connecter\")','a:has-text(\"Connexion\")',
+        'button:has-text(\"Se connecter\")','button:has-text(\"Connexion\")',
+        'a[href*=\"login\"]','a[href*=\"auth\"]'
     ])
     page.wait_for_load_state("domcontentloaded")
     accept_cookies_any(page)
     _safe_shot(page, "02-ent-after-click-login")
 
     user_candidates = [
-        'input[name="email"]','input[name="username"]','#username',
-        'input[type="text"][name*="user"]','input[type="text"]','input[type="email"]',
-        'input#email','input[name="login"]','input[name="j_username"]'
+        'input[name=\"email\"]','input[name=\"username\"]','#username',
+        'input[type=\"text\"][name*=\"user\"]','input[type=\"text\"]','input[type=\"email\"]',
+        'input#email','input[name=\"login\"]','input[name=\"j_username\"]'
     ]
     pass_candidates = [
-        'input[type="password"][name="password"]','#password','input[type="password"]','input[name="j_password"]'
+        'input[type=\"password\"][name=\"password\"]','#password','input[type=\"password\"]','input[name=\"j_password\"]'
     ]
     submit_candidates = [
-        'button[type="submit"]','input[type="submit"]',
-        'button:has-text("Se connecter")','button:has-text("Connexion")','button:has-text("Valider")'
+        'button[type=\"submit\"]','input[type=\"submit\"]',
+        'button:has-text(\"Se connecter\")','button:has-text(\"Connexion\")','button:has-text(\"Valider\")'
     ]
 
-    user_loc = first_locator_in_frames(page, user_candidates)
-    pass_loc = first_locator_in_frames(page, pass_candidates)
+    user_loc = first_locator_any(page, user_candidates)
+    pass_loc = first_locator_any(page, pass_candidates)
     if not user_loc or not pass_loc:
-        click_first_in_frames(page, [
-            'button:has-text("Identifiant")','a:has-text("Identifiant")',
-            'button:has-text("Compte")','a:has-text("Compte")','a:has-text("ENT")'
+        click_first_any(page, [
+            'button:has-text(\"Identifiant\")','a:has-text(\"Identifiant\")',
+            'button:has-text(\"Compte\")','a:has-text(\"Compte\")','a:has-text(\"ENT\")'
         ])
         page.wait_for_load_state("domcontentloaded")
         accept_cookies_any(page)
-        user_loc = first_locator_in_frames(page, user_candidates)
-        pass_loc = first_locator_in_frames(page, pass_candidates)
+        user_loc = first_locator_any(page, user_candidates)
+        pass_loc = first_locator_any(page, pass_candidates)
 
     if not user_loc or not pass_loc:
         _safe_shot(page, "03-ent-no-fields")
@@ -299,7 +333,7 @@ def login_ent(page) -> None:
 
     user_loc.fill(ENT_USER)
     pass_loc.fill(ENT_PASS)
-    if not click_first_in_frames(page, submit_candidates):
+    if not click_first_any(page, submit_candidates):
         user_loc.press("Enter")
 
     page.wait_for_load_state("domcontentloaded")
@@ -316,8 +350,8 @@ def open_pronote(context, page):
         return page
 
     with page.expect_popup() as p:
-        clicked = click_first_in_frames(page, [
-            'a:has-text("PRONOTE")','a[title*="PRONOTE"]','a[href*="pronote"]','text=PRONOTE'
+        clicked = click_first_any(page, [
+            'a:has-text(\"PRONOTE\")','a[title*=\"PRONOTE\"]','a[href*=\"pronote\"]','text=PRONOTE'
         ])
         if not clicked:
             _safe_shot(page, "06-pronote-tile-not-found")
@@ -338,21 +372,21 @@ def goto_timetable(pronote_page):
     accept_cookies_any(pronote_page)
 
     if TIMETABLE_PRE_SELECTOR:
-        click_css_in_frames(pronote_page, TIMETABLE_PRE_SELECTOR, TIMETABLE_FRAME, "pre-selector")
+        click_css_any(pronote_page, TIMETABLE_PRE_SELECTOR, "pre-selector")
     if TIMETABLE_SELECTOR:
-        if click_css_in_frames(pronote_page, TIMETABLE_SELECTOR, TIMETABLE_FRAME, "timetable-selector"):
+        if click_css_any(pronote_page, TIMETABLE_SELECTOR, "timetable-selector"):
             accept_cookies_any(pronote_page)
             try:
-                fr2 = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
+                ctx = wait_timetable_any(pronote_page, timeout_ms=30_000)
                 _safe_shot(pronote_page, "08-timetable-custom-selector")
-                return fr2
+                return ctx
             except TimeoutError:
                 _safe_shot(pronote_page, "08-timetable-custom-timeout")
 
     try:
-        fr = wait_timetable_any_frame(pronote_page, timeout_ms=10_000)
+        ctx = wait_timetable_any(pronote_page, timeout_ms=10_000)
         _safe_shot(pronote_page, "08-timetable-already-here")
-        return fr
+        return ctx
     except TimeoutError:
         pass
 
@@ -366,17 +400,17 @@ def goto_timetable(pronote_page):
             if click_text_anywhere(pronote_page, [pat]):
                 accept_cookies_any(pronote_page)
                 try:
-                    fr = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
+                    ctx = wait_timetable_any(pronote_page, timeout_ms=30_000)
                     _safe_shot(pronote_page, f"08-timetable-ready-{i}-{pat}")
-                    return fr
+                    return ctx
                 except TimeoutError:
                     _safe_shot(pronote_page, f"08-not-ready-{i}-{pat}")
         pronote_page.wait_for_timeout(600)
 
     try:
-        fr = wait_timetable_any_frame(pronote_page, timeout_ms=15_000)
+        ctx = wait_timetable_any(pronote_page, timeout_ms=15_000)
         _safe_shot(pronote_page, "08-timetable-ready-fallback")
-        return fr
+        return ctx
     except TimeoutError:
         _safe_shot(pronote_page, "08-timetable-NOT-found")
         raise RuntimeError("Impossible d’atteindre l’Emploi du temps.")
@@ -387,27 +421,29 @@ def ensure_all_visible(page) -> None:
         page.wait_for_timeout(400)
 
 def goto_week_by_index(page, n: int) -> bool:
+    # >>> FIX : clique sur l'onglet semaine au niveau page + frames
     if not WEEK_TAB_TEMPLATE:
         return False
     css = WEEK_TAB_TEMPLATE.format(n=n)
-    ok = click_css_in_frames(page, css, TIMETABLE_FRAME, f"week-{n}")
+    ok = click_css_any(page, css, f"week-{n}")
     if ok:
         try:
-            wait_timetable_any_frame(page, timeout_ms=20_000)
+            wait_timetable_any(page, timeout_ms=20_000)
         except TimeoutError:
             pass
     return ok
 
 def extract_week_info(pronote_page) -> Dict[str, Any]:
-    fr = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
-    header_text = fr.evaluate(r"""
+    ctx = wait_timetable_any(pronote_page, timeout_ms=30_000)
+    header_text = ctx.evaluate(r"""
       () => {
         const txt = (document.body.innerText || '').replace(/\s+/g,' ');
         const m = txt.match(/du\s+\d{2}\/\d{2}\/\d{4}\s+au\s+\d{2}\/\d{2}\/\d{4}/i);
         return m ? m[0] : '';
       }
     """)
-    tiles = fr.evaluate(r"""
+    # 1) collecte standard via aria-label/title + texte court
+    tiles = ctx.evaluate(r"""
       () => {
         const out = [];
         const add = (el, label) => {
@@ -423,21 +459,40 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
           }
           out.push({ label, dayIndex });
         };
-        const rx = /(\d{1,2}\s*[h:]\s*\d{2}).{0,60}(\d{1,2}\s*[h:]\s*\d{2})/i;
+        const rx = /(\d{1,2}\s*[h:]\s*\d{2}).{0,80}(\d{1,2}\s*[h:]\s*\d{2})/i;
         document.querySelectorAll('[aria-label],[title]').forEach(e => {
           const v = e.getAttribute('aria-label') || e.getAttribute('title') || '';
           if (rx.test(v)) add(e, v);
         });
         Array.from(document.querySelectorAll('body *')).forEach(e => {
           const t = (e.innerText || '').trim();
-          if (t && t.length < 200 && rx.test(t)) add(e, t);
+          if (t && t.length < 260 && rx.test(t)) add(e, t);
         });
         return out;
       }
     """)
+    # 2) Fallback spécifique PRONOTE via ids ex: #id_140_coursInt_0 > table, #id_140_cont40
+    if not tiles or len(tiles) < 3:
+        extra = ctx.evaluate(r"""
+          () => {
+            const out = [];
+            const rx = /(\d{1,2}\s*[h:]\s*\d{2}).{0,100}(\d{1,2}\s*[h:]\s*\d{2})/i;
+            const pushIf = (el) => {
+              if (!el) return;
+              const txt = (el.innerText || '').replace(/\s+/g,' ').trim();
+              if (txt && rx.test(txt)) {
+                out.push({ label: txt, dayIndex: null });
+              }
+            };
+            document.querySelectorAll('[id^="id_"][id*="coursInt_"] table, [id^="id_"][id*="cont"]').forEach(pushIf);
+            return out;
+          }
+        """)
+        tiles = (tiles or []) + (extra or [])
+
     d0 = None
     try:
-        m = re.search(r'(\d{2}/\d{2}/\d{4}).*?(\d{2}/\d{2}/\d{4})', header_text or '')
+        m = re.search(r'(\\d{2}/\\d{2}/\\d{4}).*?(\\d{2}/\\d{2}/\\d{4})', header_text or '')
         if m:
             d0 = datetime.strptime(m.group(1), "%d/%m/%Y")
     except Exception:
@@ -445,16 +500,17 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
     return {"monday": d0, "tiles": tiles, "header": header_text}
 
 def iter_next_week(pronote_page) -> bool:
-    if click_first_in_frames(pronote_page, [
-        'button[title*="suivante"]','button[aria-label*="suivante"]','button:has-text("→")',
-        'a[title*="suivante"]','a:has-text("Semaine suivante")'
+    if click_first_any(pronote_page, [
+        'button[title*=\"suivante\"]','button[aria-label*=\"suivante\"]','button:has-text(\"→\")',
+        'a[title*=\"suivante\"]','a:has-text(\"Semaine suivante\")'
     ]):
         accept_cookies_any(pronote_page)
-        wait_timetable_any_frame(pronote_page)
+        wait_timetable_any(pronote_page)
         _safe_shot(pronote_page, "09-pronote-next-week")
         return True
     return False
 
+# ===================== Main =====================
 def run() -> None:
     if not ENT_USER or not ENT_PASS:
         raise SystemExit("PRONOTE_USER / PRONOTE_PASS manquants.")
@@ -478,6 +534,7 @@ def run() -> None:
         end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
 
         for week_idx in range(start_idx, end_idx + 1):
+            log(f"⇢ Sélection Semaine index={week_idx} via css '{WEEK_TAB_TEMPLATE.format(n=week_idx)}'")
             used_tab = goto_week_by_index(pronote, week_idx)
             accept_cookies_any(pronote)
             ensure_all_visible(pronote)
@@ -485,7 +542,7 @@ def run() -> None:
             info  = extract_week_info(pronote)
             d0    = info["monday"]
             tiles = info["tiles"] or []
-            hdr   = (info.get("header") or "").replace("\n", " ")[:120]
+            hdr   = (info.get("header") or "").replace("\\n", " ")[:160]
             log(f"Semaine {week_idx}: {len(tiles)} cases, header='{hdr}'")
 
             for t in tiles:
