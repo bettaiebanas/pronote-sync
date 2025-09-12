@@ -127,14 +127,24 @@ H_PATTERNS = [
 DURATION_RE = re.compile(r'(?P<dh>\\d{1,2})\\s*[hH]\\s*(?P<dm>\\d{2})')
 
 def parse_times(text: str) -> Dict[str, Optional[tuple[int,int]]]:
-    """Supporte: '08h05 - 09h00' OU '1h00 - vendredi 26/09 à 08h05'"""
+    """Supporte: 
+    - '08h05 - 09h00'  -> start/end
+    - '1h00 - vendredi 26/09 à 11h15' -> durée + début
+    """
+    t = (text or "").strip()
     hours: List[tuple[int,int]] = []
     for rx in H_PATTERNS:
-        for m in rx.finditer(text or ""):
+        for m in rx.finditer(t):
             hours.append((int(m.group("h")), int(m.group("m"))))
+
+    # Cas PRONOTE classique: "durée - ... à HH:MM" + date dd/mm quelque part
+    if 'à' in t and re.search(r'\\d{1,2}\\s*/\\s*\\d{1,2}', t) and len(hours) == 2:
+        return {"start": hours[1], "end": None, "duration": hours[0]}
+
     if len(hours) >= 2:
         return {"start": hours[0], "end": hours[1], "duration": None}
-    dm = DURATION_RE.search(text or "")
+
+    dm = DURATION_RE.search(t)
     if dm and hours:
         return {"start": hours[-1], "end": None, "duration": (int(dm.group("dh")), int(dm.group("dm")))}
     return {"start": None, "end": None, "duration": None}
@@ -393,7 +403,7 @@ def goto_week_by_index(page, n: int) -> bool:
         except TimeoutError: pass
     return ok
 
-# ===================== Extraction (clic & panneau) =====================
+# ===================== Extraction =====================
 CANDIDATE_SELECTORS = [
     '[id^="id_"][id*="_coursInt_"] table',
     '[id^="id_"][id*="_coursInt_"]',
@@ -412,16 +422,14 @@ def _click_candidate(ctx, sel: str, idx: int) -> bool:
       return true;
     }""", {"sel": sel, "i": idx})
 
-
 def _read_visible_panel(ctx) -> Optional[Dict[str, Any]]:
-    # Ne filtre plus par offsetParent (les panneaux PRONOTE peuvent être en position:fixed)
+    # Ne filtre pas par offsetParent (panneaux en position:fixed)
     for _ in range(PANEL_RETRIES):
         panel = ctx.evaluate(r"""() => {
           const panels = Array.from(document.querySelectorAll('.ConteneurCours'));
           if (!panels.length) return null;
           const p = panels[panels.length-1];
           const header = (p.querySelector('.EnteteCoursLibelle')?.innerText||'').replace(/\s+/g,' ').trim();
-          // Même si le panneau est "masqué" par offsetParent null, on lit quand même le contenu.
           const groups = Array.from(p.querySelectorAll('[role="group"]'));
           const pick = (name) => {
             const g = groups.find(x => (x.getAttribute('aria-label')||'').toLowerCase().includes(name));
@@ -435,6 +443,7 @@ def _read_visible_panel(ctx) -> Optional[Dict[str, Any]]:
     return None
 
 def _collect_pairs_by_proximity(ctx) -> List[Dict[str, str]]:
+    # Associe coursInt et cont par proximité verticale au sein de la même base id_xxx_
     return ctx.evaluate(r"""() => {
       const cours = Array.from(document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')).map(e=>({id:e.id, r:e.getBoundingClientRect()}));
       const conts = Array.from(document.querySelectorAll('[id^="id_"][id*="_cont"]')).map(e=>({id:e.id, r:e.getBoundingClientRect(), text:(e.innerText||'').replace(/\s+/g,' ').trim()}));
@@ -480,6 +489,7 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
     tiles: List[Dict[str, Any]] = []
     year = (monday.year if monday else datetime.now().year)
 
+    # Comptages pour debug/transparence
     counts = {}
     for sel in CANDIDATE_SELECTORS:
         try:
@@ -517,6 +527,38 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         if len(tiles) >= MAX_TILES_PER_WEEK:
             break
 
+    # Fallback A: lire tous les panneaux déjà ouverts (sans cliquer)
+    if not tiles:
+        panels = ctx.evaluate(r"""() => {
+          const list = [];
+          const panels = Array.from(document.querySelectorAll('.ConteneurCours'));
+          for (const p of panels) {
+            const header = (p.querySelector('.EnteteCoursLibelle')?.innerText||'').replace(/\s+/g,' ').trim();
+            if (!header) continue;
+            const groups = Array.from(p.querySelectorAll('[role="group"]'));
+            const pick = (name) => {
+              const g = groups.find(x => (x.getAttribute('aria-label')||'').toLowerCase().includes(name));
+              return g ? (g.innerText||'').replace(/\s+/g,' ').trim() : '';
+            };
+            list.push({ header, matiere: pick('matière') || pick('matiere'), salle: pick('salles') || pick('salle') });
+          }
+          return list;
+        }""")
+        for panel in (panels or []):
+            parsed = parse_panel(panel, year)
+            if not parsed: 
+                continue
+            tiles.append({
+                "label": f"{parsed['summary']} — {panel.get('header','')}",
+                "summary": parsed["summary"],
+                "room": parsed["room"],
+                "start_dt": parsed["start_dt"],
+                "end_dt": parsed["end_dt"]
+            })
+            if len(tiles) >= MAX_TILES_PER_WEEK:
+                break
+
+    # Fallback B: appariement par proximité + inférence du jour (lundi→dimanche)
     if not tiles:
         pairs = _collect_pairs_by_proximity(ctx)
         _safe_write(f"{SCREEN_DIR}/edp_pairs_preview.json", json.dumps(pairs[:10], ensure_ascii=False, indent=2))
@@ -526,19 +568,17 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
             times = parse_times(aria)
             if not (times["start"] or times["end"]):
                 continue
+            # Résolution date: dd/mm explicite, sinon inférence par jour + 'monday'
             dt_date = parse_date_from_text(aria, fallback_year=year)
-            # If no explicit dd/mm date, infer from weekday relative to 'monday' header
             if not dt_date and monday:
                 text_l = (aria or '').lower()
                 jours = ['lundi','mardi','mercredi','jeudi','vendredi','samedi','dimanche']
                 found = next((i for i,n in enumerate(jours) if n in text_l), None)
                 if found is not None:
                     dt_date = monday + timedelta(days=found)
-            # As a very last resort, keep monday (less accurate but avoids crash)
-            if not dt_date:
-                dt_date = monday
             if not dt_date:
                 continue
+
             start_hm = times["start"]; end_hm = times["end"]
             if start_hm and end_hm:
                 start_dt = to_dt(dt_date, start_hm)
