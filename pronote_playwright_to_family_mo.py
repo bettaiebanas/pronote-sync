@@ -1,26 +1,5 @@
-# pronote_playwright_to_family_mo.py (cleaned)
+# pronote_playwright_to_family_mo.py
 # SPDX-License-Identifier: MIT
-"""
-Synchronise l'emploi du temps PRONOTE vers Google Calendar (famille) via Playwright.
-
-- Se connecte à l'ENT
-- Ouvre PRONOTE et atteint "Emploi du temps"
-- Parcourt n semaines et crée/met à jour des événements dans Google Calendar
-- Déduplication robuste via un ID d'événement stable (SHA1 des champs clés)
-
-Exige :
-- Python 3.10+
-- Playwright (chromium)
-- google-api-python-client, google-auth-httplib2, google-auth-oauthlib
-- credentials.json et token.json (OAuth) à la racine ou fournis via secrets
-
-Variables d'environnement (voir workflow .yml) :
-- PRONOTE_USER, PRONOTE_PASS (obligatoires)
-- CALENDAR_ID (obligatoire)
-- ENT_URL, PRONOTE_URL (facultatifs)
-- TIMETABLE_PRE_SELECTOR, TIMETABLE_SELECTOR, TIMETABLE_FRAME, WEEK_TAB_TEMPLATE
-- FETCH_WEEKS_FROM, WEEKS_TO_FETCH, CLICK_TOUT_VOIR, WAIT_AFTER_NAV_MS, HEADFUL
-"""
 from __future__ import annotations
 
 import os
@@ -38,22 +17,20 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-
-# ===================== Config & Const =====================
 ENT_URL       = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
-PRONOTE_URL   = os.getenv("PRONOTE_URL", "")  # si vide: clic sur la tuile PRONOTE depuis l’ENT
+PRONOTE_URL   = os.getenv("PRONOTE_URL", "")
 ENT_USER      = os.getenv("PRONOTE_USER", "")
 ENT_PASS      = os.getenv("PRONOTE_PASS", "")
 
 CALENDAR_ID   = os.getenv("CALENDAR_ID", "")
 TITLE_PREFIX  = os.getenv("TITLE_PREFIX", "[Mo] ")
-COLOR_ID      = os.getenv("COLOR_ID", "6")  # 6 = orange
+COLOR_ID      = os.getenv("COLOR_ID", "6")
 HEADFUL       = os.getenv("HEADFUL", "0") == "1"
 
 TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
 TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
 TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
-WEEK_TAB_TEMPLATE      = os.getenv("WEEK_TAB_TEMPLATE", "").strip()  # ex: #GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}
+WEEK_TAB_TEMPLATE      = os.getenv("WEEK_TAB_TEMPLATE", "").strip()
 FETCH_WEEKS_FROM       = int(os.getenv("FETCH_WEEKS_FROM", "1"))
 WEEKS_TO_FETCH         = int(os.getenv("WEEKS_TO_FETCH", "4"))
 CLICK_TOUT_VOIR        = os.getenv("CLICK_TOUT_VOIR", "1") == "1"
@@ -67,8 +44,6 @@ TIMEZONE         = "Europe/Paris"
 TIMEOUT_MS  = 120_000
 SCREEN_DIR  = "screenshots"
 
-
-# ===================== Helpers =====================
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}")
@@ -95,11 +70,9 @@ def _safe_shot(page, name: str) -> None:
     except Exception:
         pass
 
-
-# ===================== Google Calendar =====================
 def get_gcal_service():
     if not CALENDAR_ID:
-        raise SystemExit("CALENDAR_ID manquant. Renseigne la variable d'environnement.")
+        raise SystemExit("CALENDAR_ID manquant.")
 
     creds = None
     if os.path.exists(TOKEN_FILE):
@@ -120,7 +93,6 @@ def get_gcal_service():
     return build("calendar", "v3", credentials=creds)
 
 def upsert_event_by_id(svc, cal_id: str, event_id: str, body: Dict[str, Any]) -> str:
-    """Update si existe, sinon create avec le même ID. Renvoie 'updated' ou 'created'."""
     try:
         svc.events().get(calendarId=cal_id, eventId=event_id).execute()
         svc.events().patch(calendarId=cal_id, eventId=event_id, body=body, sendUpdates="none").execute()
@@ -133,8 +105,6 @@ def upsert_event_by_id(svc, cal_id: str, event_id: str, body: Dict[str, Any]) ->
             return "created"
         raise
 
-
-# ===================== Parsing =====================
 HOUR_RE = re.compile(r'(?P<h>\d{1,2})[:hH](?P<m>\d{2})')
 
 def parse_timespan(text: str):
@@ -145,7 +115,6 @@ def parse_timespan(text: str):
     return None
 
 def parse_aria_label(label: str) -> Dict[str, Any]:
-    """Extrait heures, titre et salle depuis un aria-label/title/innerText."""
     d: Dict[str, Any] = {"start": None, "end": None, "summary": None, "room": ""}
     lab = " ".join((label or "").split())
 
@@ -172,8 +141,6 @@ def to_datetime(base_monday: Optional[datetime], day_idx: Optional[int], hm: tup
         base = datetime.now()
     return base.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
 
-
-# ===================== Playwright utils =====================
 def first_locator_in_frames(page, selectors: List[str]):
     for frame in page.frames:
         for sel in selectors:
@@ -227,7 +194,6 @@ def wait_timetable_any_frame(page, timeout_ms: int = TIMEOUT_MS):
 def click_text_anywhere(page, patterns: List[str]) -> bool:
     for frame in page.frames:
         for pat in patterns:
-            # Liens/boutons standards
             for loc in [
                 frame.get_by_role("link", name=re.compile(pat, re.I)),
                 frame.get_by_role("button", name=re.compile(pat, re.I)),
@@ -238,7 +204,6 @@ def click_text_anywhere(page, patterns: List[str]) -> bool:
                         return True
                 except Exception:
                     pass
-            # Fallback DOM brut
             try:
                 found = frame.evaluate(
                     r"""
@@ -286,8 +251,6 @@ def click_css_in_frames(page, css: str, frame_url_contains: str = "", screenshot
             log(f"[NAV] click_css_in_frames fail in {getattr(fr,'url','?')}: {e}")
     return False
 
-
-# ===================== Navigation =====================
 def login_ent(page) -> None:
     _safe_mkdir(SCREEN_DIR)
     page.set_default_timeout(TIMEOUT_MS)
@@ -332,7 +295,7 @@ def login_ent(page) -> None:
 
     if not user_loc or not pass_loc:
         _safe_shot(page, "03-ent-no-fields")
-        raise RuntimeError("Champ identifiant ENT introuvable. Mets HEADFUL=1 pour ajuster.")
+        raise RuntimeError("Champ identifiant ENT introuvable.")
 
     user_loc.fill(ENT_USER)
     pass_loc.fill(ENT_PASS)
@@ -358,7 +321,7 @@ def open_pronote(context, page):
         ])
         if not clicked:
             _safe_shot(page, "06-pronote-tile-not-found")
-            raise RuntimeError("Tuile/lien PRONOTE introuvable après login ENT.")
+            raise RuntimeError("Tuile PRONOTE introuvable.")
     try:
         pronote_page = p.value
         pronote_page.wait_for_load_state("domcontentloaded")
@@ -374,7 +337,6 @@ def goto_timetable(pronote_page):
     pronote_page.set_default_timeout(TIMEOUT_MS)
     accept_cookies_any(pronote_page)
 
-    # Chemin manuel (facultatif) : "Vie scolaire" -> "Emploi du temps"
     if TIMETABLE_PRE_SELECTOR:
         click_css_in_frames(pronote_page, TIMETABLE_PRE_SELECTOR, TIMETABLE_FRAME, "pre-selector")
     if TIMETABLE_SELECTOR:
@@ -387,7 +349,6 @@ def goto_timetable(pronote_page):
             except TimeoutError:
                 _safe_shot(pronote_page, "08-timetable-custom-timeout")
 
-    # Déjà dessus ?
     try:
         fr = wait_timetable_any_frame(pronote_page, timeout_ms=10_000)
         _safe_shot(pronote_page, "08-timetable-already-here")
@@ -418,7 +379,7 @@ def goto_timetable(pronote_page):
         return fr
     except TimeoutError:
         _safe_shot(pronote_page, "08-timetable-NOT-found")
-        raise RuntimeError("Impossible d’atteindre l’Emploi du temps (après multiples essais).")
+        raise RuntimeError("Impossible d’atteindre l’Emploi du temps.")
 
 def ensure_all_visible(page) -> None:
     if CLICK_TOUT_VOIR:
@@ -438,7 +399,6 @@ def goto_week_by_index(page, n: int) -> bool:
     return ok
 
 def extract_week_info(pronote_page) -> Dict[str, Any]:
-    """Récupère les 'tiles' de cours et la tranche de semaine (du .. au ..)."""
     fr = wait_timetable_any_frame(pronote_page, timeout_ms=30_000)
     header_text = fr.evaluate(r"""
       () => {
@@ -452,7 +412,6 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
         const out = [];
         const add = (el, label) => {
           if (!label) return;
-          // essaie de retrouver le dayIndex en remontant
           let dayIndex = null, p = el;
           while (p) {
             if (p.getAttribute && p.getAttribute('data-dayindex')) {
@@ -496,11 +455,9 @@ def iter_next_week(pronote_page) -> bool:
         return True
     return False
 
-
-# ===================== Main =====================
 def run() -> None:
     if not ENT_USER or not ENT_PASS:
-        raise SystemExit("Identifiants ENT manquants: PRONOTE_USER / PRONOTE_PASS.")
+        raise SystemExit("PRONOTE_USER / PRONOTE_PASS manquants.")
 
     svc = get_gcal_service()
     created = updated = 0
@@ -510,7 +467,6 @@ def run() -> None:
         context = browser.new_context(locale="fr-FR", timezone_id=TIMEZONE)
         page = context.new_page(); page.set_default_timeout(TIMEOUT_MS)
 
-        # ENT → PRONOTE → Emploi du temps
         log("Connexion ENT…")
         login_ent(page)
         log("Ouverture PRONOTE…")
@@ -518,7 +474,6 @@ def run() -> None:
         log("Navigation vers 'Emploi du temps'…")
         goto_timetable(pronote)
 
-        # Parcours des semaines
         start_idx = max(1, FETCH_WEEKS_FROM)
         end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
 
@@ -545,7 +500,6 @@ def run() -> None:
                 end_dt   = to_datetime(d0, t.get("dayIndex"), parsed["end"])
 
                 now = datetime.now()
-                # garde ~3 dernières semaines et 90 jours à venir
                 if end_dt < (now - timedelta(days=21)) or start_dt > (now + timedelta(days=90)):
                     continue
 
@@ -568,7 +522,6 @@ def run() -> None:
                 except HttpError as e:
                     log(f"[GCAL] {e}")
 
-            # fallback si pas d’onglet semaine
             if not used_tab and week_idx < end_idx:
                 if not iter_next_week(pronote):
                     break
@@ -576,7 +529,6 @@ def run() -> None:
         browser.close()
 
     log(f"Terminé. créés={created}, maj={updated}")
-
 
 if __name__ == "__main__":
     try:
