@@ -1,19 +1,13 @@
-# .github/workflows/sync.yml (cleaned)
-name: PRONOTE → Google Calendar (Playwright)
+name: pronote-to-family-mo (Playwright)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '5 6,16 * * *'   # 06:05 et 16:05 UTC ≈ 08:05/18:05 Paris
-
-concurrency:
-  group: pronote-gcal-sync
-  cancel-in-progress: false
+    - cron: '5 6,16 * * *'
 
 jobs:
   sync:
-    runs-on: [self-hosted, Windows]  # adapte si besoin (ex: ubuntu-latest)
-    timeout-minutes: 30
+    runs-on: [self-hosted, Windows]
 
     defaults:
       run:
@@ -27,7 +21,7 @@ jobs:
       ENT_URL:      https://ent77.seine-et-marne.fr/welcome
       PRONOTE_URL:  "https://0771342r.index-education.net/pronote/parent.html"
 
-      HEADFUL:      "1"  # mets "1" pour voir le navigateur sur le runner
+      HEADFUL:      "1"
       TIMETABLE_PRE_SELECTOR: '#GInterface\.Instances\[0\]\.Instances\[1\]_Combo5'
       TIMETABLE_SELECTOR:     '#GInterface\.Instances\[0\]\.Instances\[1\]_Liste_niveau5 > ul > li:nth-child(1) > div > div'
       TIMETABLE_FRAME:        'parent.html'
@@ -49,7 +43,6 @@ jobs:
         run: Start-Sleep -Seconds (Get-Random -Minimum 30 -Maximum 300)
 
       - name: IP publique du job
-        continue-on-error: true
         run: |
           try {
             $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
@@ -59,12 +52,11 @@ jobs:
           }
 
       - name: Recréer OAuth Google (depuis secrets)
-        if: ${{ secrets.GCAL_CLIENT_SECRET != '' && secrets.GCAL_TOKEN_JSON != '' }}
         run: |
           Set-Content -Path credentials.json -Value '${{ secrets.GCAL_CLIENT_SECRET }}' -NoNewline
           Set-Content -Path token.json        -Value '${{ secrets.GCAL_TOKEN_JSON }}'  -NoNewline
 
-      - name: Bootstrap pip
+      - name: Bootstrap pip (toolcache Windows)
         run: |
           & "$env:pythonLocation\python.exe" -V
           & "$env:pythonLocation\python.exe" -m ensurepip --upgrade
