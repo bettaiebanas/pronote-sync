@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import os, re, sys, time, json, hashlib, unicodedata
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Frame
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -26,7 +26,7 @@ HEADFUL       = os.getenv("HEADFUL", "0") == "1"
 
 TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
 TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
-TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
+TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()  # ex: 'parent.html'
 WEEK_TAB_TEMPLATE      = os.getenv("WEEK_TAB_TEMPLATE", "#GInterface\\.Instances\\[2\\]\\.Instances\\[0\\]_j_{n}").strip()
 
 FETCH_WEEKS_FROM       = int(os.getenv("FETCH_WEEKS_FROM", "1"))
@@ -36,10 +36,10 @@ WAIT_AFTER_NAV_MS      = int(os.getenv("WAIT_AFTER_NAV_MS", "1000"))
 
 # Bornes anti-hang
 MAX_TILES_PER_WEEK     = int(os.getenv("MAX_TILES_PER_WEEK", "120"))
-MAX_CLICK_PER_SELECTOR = int(os.getenv("MAX_CLICK_PER_SELECTOR", "120"))  # compat
+MAX_CLICK_PER_SELECTOR = int(os.getenv("MAX_CLICK_PER_SELECTOR", "120"))
 WEEK_HARD_TIMEOUT_MS   = int(os.getenv("WEEK_HARD_TIMEOUT_MS", "120000"))
 PANEL_WAIT_MS          = int(os.getenv("PANEL_WAIT_MS", "350"))
-PANEL_RETRIES          = int(os.getenv("PANEL_RETRIES", "8"))  # ~2.8s par clic
+PANEL_RETRIES          = int(os.getenv("PANEL_RETRIES", "8"))
 
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
@@ -58,17 +58,16 @@ except Exception:
 
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        print(f"[{ts}] {msg}")
-    except UnicodeEncodeError:
-        print(f"[{ts}] {msg}".encode("ascii","replace").decode("ascii"))
+    try: print(f"[{ts}] {msg}")
+    except UnicodeEncodeError: print(f"[{ts}] {msg}".encode("ascii","replace").decode("ascii"))
 
 def _safe_mkdir(p: str) -> None:
     try: os.makedirs(p, exist_ok=True)
     except Exception: pass
 
-def _safe_shot(page, name: str) -> None:
+def _safe_shot(page_or_frame: Union[Page, Frame], name: str) -> None:
     try:
+        page = page_or_frame if isinstance(page_or_frame, Page) else page_or_frame.page
         _safe_mkdir(SCREEN_DIR)
         page.screenshot(path=f"{SCREEN_DIR}/{name}.png", full_page=True)
     except Exception: pass
@@ -138,8 +137,7 @@ def parse_times(text: str) -> Dict[str, Optional[tuple[int,int]]]:
         for m in rx.finditer(t):
             hours.append((int(m.group("h")), int(m.group("m"))))
 
-    # Cas PRONOTE classique: "durée - ... à HH:MM" + date dd/mm quelque part
-    if 'à' in t and re.search(r'\d{1,2}\s*/\s*\d{1,2}', t) and len(hours) == 2:
+    if 'à' in t and re.search(r'\d{1,2}\s*/\s*\d{1,2}(?:\s*/\s*\d{2,4})?', t) and len(hours) == 2:
         return {"start": hours[1], "end": None, "duration": hours[0]}
 
     if len(hours) >= 2:
@@ -156,10 +154,11 @@ MONTHS_FR = {
 }
 
 def parse_date_from_text(text: str, fallback_year: int) -> Optional[datetime]:
-    m = re.search(r'(\d{1,2})\s*/\s*(\d{1,2})(?:\s*/\s*(\d{4}))?', text or '')
+    m = re.search(r'(\d{1,2})\s*/\s*(\d{1,2})(?:\s*/\s*(\d{2,4}))?', text or '')
     if m:
         d, mo = int(m.group(1)), int(m.group(2))
         y = int(m.group(3)) if m.group(3) else fallback_year
+        if y < 100: y += 2000
         return datetime(y, mo, d)
     m = re.search(r'(\d{1,2})\s+([A-Za-zéûùôîïàâç]+)', text or '', re.IGNORECASE)
     if m:
@@ -176,7 +175,7 @@ def parse_panel(panel: Dict[str, Any], year: int) -> Optional[Dict[str, Any]]:
     header = panel.get("header","")
     matiere = re.sub(r'\s+', ' ', (panel.get("matiere","") or "").strip())
     salle   = re.sub(r'\s+', ' ', (panel.get("salle","") or "").strip())
-    times = parse_times(header)  # peut retourner durée
+    times = parse_times(header)
     if not (times["start"] or times["end"]):
         return None
     dt_date = parse_date_from_text(header, fallback_year=year)
@@ -199,20 +198,21 @@ def parse_panel(panel: Dict[str, Any], year: int) -> Optional[Dict[str, Any]]:
     return {"summary": summary, "room": salle, "start_dt": start_dt, "end_dt": end_dt}
 
 # ===================== Playwright helpers =====================
-def _iter_contexts(page):
+def _iter_contexts(page: Page):
     yield page
     for fr in page.frames: yield fr
 
-def first_locator_any(page, selectors: List[str]):
+def first_locator_any(page: Page, selectors: List[str]):
     for ctx in _iter_contexts(page):
-        for sel in selectors:
-            try:
+        try:
+            for sel in selectors:
                 loc = ctx.locator(sel)
                 if loc.count() > 0: return loc.first
-            except Exception: continue
+        except Exception: 
+            continue
     return None
 
-def click_first_any(page, selectors: List[str]) -> bool:
+def click_first_any(page: Page, selectors: List[str]) -> bool:
     loc = first_locator_any(page, selectors)
     if not loc: return False
     try:
@@ -224,7 +224,7 @@ def click_first_any(page, selectors: List[str]) -> bool:
         except Exception: pass
         return False
 
-def accept_cookies_any(page) -> None:
+def accept_cookies_any(page: Page) -> None:
     texts = ["Tout accepter","Accepter tout","J'accepte","Accepter","OK","Continuer","J'ai compris"]
     sels = [f'button:has-text("{t}")' for t in texts] + [f'role=button[name="{t}"]' for t in texts]
     click_first_any(page, sels)
@@ -234,47 +234,68 @@ def _frame_has_timetable_js() -> str:
       () => {
         const txt = (document.body.innerText || '').replace(/\s+/g,' ');
         const hasTitle = /Emploi du temps/i.test(txt) || /Planning|Agenda/i.test(txt);
-        const hasWeek  = /(Semaine|du\s+\d{1,2}\/\d{1,2}\/\d{4})/i.test(txt);
+        const hasWeek  = /(Semaine|du\s+\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\s+au\s+\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)/i.test(txt);
         const hasTimes = /\d{1,2}\s*[h:]\s*\d{2}|heures?\s*\d{2}/i.test(txt);
         return (hasTitle && (hasTimes || hasWeek)) || (hasWeek && hasTimes);
       }
     """
 
-def wait_timetable_any(page, timeout_ms: int = TIMEOUT_MS):
+def find_timetable_ctx(page: Page, timeout_ms: int = TIMEOUT_MS) -> Union[Page, Frame]:
+    """Choisit le bon frame: d'abord via TIMETABLE_FRAME, sinon via heuristique contenu."""
     deadline = time.time() + timeout_ms/1000.0
-    js = _frame_has_timetable_js()
     while time.time() < deadline:
-        for ctx in _iter_contexts(page):
+        # 1) Préférence explicite
+        if TIMETABLE_FRAME:
+            for fr in page.frames:
+                try:
+                    if TIMETABLE_FRAME in (fr.url or "") or TIMETABLE_FRAME in (fr.name or ""):
+                        if fr.evaluate(_frame_has_timetable_js()): 
+                            return fr
+                except Exception: 
+                    continue
+        # 2) Heuristique contenu
+        for fr in page.frames:
             try:
-                if ctx.evaluate(js): return ctx
-            except Exception: pass
-        page.wait_for_timeout(250)
-    raise TimeoutError("Timetable not found")
-
-def click_css_any(page, css: str, screenshot_tag: str = "") -> bool:
-    if not css: return False
-    for ctx in _iter_contexts(page):
+                if fr.evaluate(_frame_has_timetable_js()):
+                    return fr
+            except Exception: 
+                continue
+        # 3) Page elle-même
         try:
-            loc = ctx.locator(css)
-            if loc.count() > 0:
-                try: loc.first.scroll_into_view_if_needed()
-                except Exception: pass
-                try: loc.first.click()
-                except Exception:
-                    try:
-                        el = loc.first.element_handle()
-                        if el: el.evaluate("(n)=>{ n.click(); n.dispatchEvent(new MouseEvent('mousedown',{bubbles:true})); n.dispatchEvent(new MouseEvent('mouseup',{bubbles:true})); n.dispatchEvent(new MouseEvent('click',{bubbles:true})); }")
-                        else: continue
-                    except Exception: continue
-                page.wait_for_timeout(WAIT_AFTER_NAV_MS)
-                if screenshot_tag: _safe_shot(page, f"08-clicked-{screenshot_tag}")
-                return True
-        except Exception as e:
-            log(f"[NAV] click_css_any fail: {e}")
+            if page.evaluate(_frame_has_timetable_js()):
+                return page
+        except Exception: 
+            pass
+        page.wait_for_timeout(250)
+    raise TimeoutError("Timetable context not found")
+
+def wait_timetable_any(page: Page, timeout_ms: int = TIMEOUT_MS) -> Union[Page, Frame]:
+    return find_timetable_ctx(page, timeout_ms)
+
+def click_css_any(page_or_frame: Union[Page, Frame], css: str, screenshot_tag: str = "") -> bool:
+    if not css: return False
+    ctx = page_or_frame
+    try:
+        loc = ctx.locator(css)
+        if loc.count() > 0:
+            try: loc.first.scroll_into_view_if_needed()
+            except Exception: pass
+            try: loc.first.click()
+            except Exception:
+                try:
+                    el = loc.first.element_handle()
+                    if el: el.evaluate("(n)=>{ n.click(); n.dispatchEvent(new MouseEvent('mousedown',{bubbles:true})); n.dispatchEvent(new MouseEvent('mouseup',{bubbles:true})); n.dispatchEvent(new MouseEvent('click',{bubbles:true})); }")
+                    else: return False
+                except Exception: return False
+            (ctx.page if isinstance(ctx, Frame) else ctx).wait_for_timeout(WAIT_AFTER_NAV_MS)
+            if screenshot_tag: _safe_shot(ctx, f"08-clicked-{screenshot_tag}")
+            return True
+    except Exception as e:
+        log(f"[NAV] click_css_any fail: {e}")
     return False
 
 # ===================== Navigation =====================
-def login_ent(page) -> None:
+def login_ent(page: Page) -> None:
     _safe_mkdir(SCREEN_DIR)
     page.set_default_timeout(TIMEOUT_MS)
     page.goto(ENT_URL)
@@ -324,7 +345,7 @@ def login_ent(page) -> None:
     accept_cookies_any(page)
     _safe_shot(page, "05-ent-after-submit")
 
-def open_pronote(context, page):
+def open_pronote(context, page: Page):
     page.set_default_timeout(TIMEOUT_MS)
     if PRONOTE_URL:
         page.goto(PRONOTE_URL)
@@ -351,7 +372,7 @@ def open_pronote(context, page):
     _safe_shot(pronote_page, "07-pronote-home")
     return pronote_page
 
-def goto_timetable(pronote_page):
+def goto_timetable(pronote_page: Page) -> Union[Page, Frame]:
     pronote_page.set_default_timeout(TIMEOUT_MS)
     accept_cookies_any(pronote_page)
 
@@ -361,14 +382,14 @@ def goto_timetable(pronote_page):
         if click_css_any(pronote_page, TIMETABLE_SELECTOR, "timetable-selector"):
             accept_cookies_any(pronote_page)
             try:
-                ctx = wait_timetable_any(pronote_page, timeout_ms=30_000)
-                _safe_shot(pronote_page, "08-timetable-custom-selector"); return ctx
+                ctx = find_timetable_ctx(pronote_page, timeout_ms=30_000)
+                _safe_shot(ctx, "08-timetable-custom-selector"); return ctx
             except TimeoutError:
                 _safe_shot(pronote_page, "08-timetable-custom-timeout")
 
     try:
-        ctx = wait_timetable_any(pronote_page, timeout_ms=10_000)
-        _safe_shot(pronote_page, "08-timetable-already-here"); return ctx
+        ctx = find_timetable_ctx(pronote_page, timeout_ms=10_000)
+        _safe_shot(ctx, "08-timetable-already-here"); return ctx
     except TimeoutError: pass
 
     attempts = [["Emploi du temps","Mon emploi du temps","Emplois du temps"],["Planning","Agenda"],["Vie scolaire","Emploi du temps"]]
@@ -377,36 +398,37 @@ def goto_timetable(pronote_page):
             if click_first_any(pronote_page, [f'*:has-text("{pat}")']):
                 accept_cookies_any(pronote_page)
                 try:
-                    ctx = wait_timetable_any(pronote_page, timeout_ms=30_000)
-                    _safe_shot(pronote_page, f"08-timetable-ready-{i}-{pat}"); return ctx
+                    ctx = find_timetable_ctx(pronote_page, timeout_ms=30_000)
+                    _safe_shot(ctx, f"08-timetable-ready-{i}-{pat}"); return ctx
                 except TimeoutError:
                     _safe_shot(pronote_page, f"08-not-ready-{i}-{pat}")
         pronote_page.wait_for_timeout(400)
 
     try:
-        ctx = wait_timetable_any(pronote_page, timeout_ms=15_000)
-        _safe_shot(pronote_page, "08-timetable-ready-fallback"); return ctx
+        ctx = find_timetable_ctx(pronote_page, timeout_ms=15_000)
+        _safe_shot(ctx, "08-timetable-ready-fallback"); return ctx
     except TimeoutError:
         _safe_shot(pronote_page, "08-timetable-NOT-found")
         raise RuntimeError("Impossible d'atteindre l'Emploi du temps.")
 
-def ensure_all_visible(page) -> None:
+def ensure_all_visible(ctx: Union[Page, Frame]) -> None:
     if CLICK_TOUT_VOIR:
-        click_first_any(page, ['*:has-text("Tout voir")','*:has-text("Voir tout")','*:has-text("Tout afficher")'])
-        page.wait_for_timeout(250)
+        click_css_any(ctx, '*:has-text("Tout voir")', "tout-voir") or \
+        click_css_any(ctx, '*:has-text("Voir tout")', "voir-tout") or \
+        click_css_any(ctx, '*:has-text("Tout afficher")', "tout-afficher")
+        (ctx.page if isinstance(ctx, Frame) else ctx).wait_for_timeout(250)
 
-def goto_week_by_index(page, n: int) -> bool:
+def goto_week_by_index(ctx: Union[Page, Frame], n: int) -> bool:
     if not WEEK_TAB_TEMPLATE: return False
     css = WEEK_TAB_TEMPLATE.format(n=n)
-    ok = click_css_any(page, css, f"week-{n}")
+    ok = click_css_any(ctx, css, f"week-{n}")
     if ok:
-        try: wait_timetable_any(page, timeout_ms=20_000)
+        try: find_timetable_ctx(ctx.page if isinstance(ctx, Frame) else ctx, timeout_ms=20_000)
         except TimeoutError: pass
     return ok
 
 # ===================== Extraction =====================
-def _list_course_ids(ctx) -> List[str]:
-    """IDs de cours (_coursInt_) et de contenus (_cont*), dédoublonnés et ordonnés verticalement."""
+def _list_course_ids(ctx: Union[Page, Frame]) -> List[str]:
     try:
         ids = ctx.evaluate(r"""() => {
           const pos = (e) => (e?.getBoundingClientRect()?.top || 9e9);
@@ -422,7 +444,7 @@ def _list_course_ids(ctx) -> List[str]:
     except Exception:
         return []
 
-def _click_by_id(ctx, el_id: str) -> bool:
+def _click_by_id(ctx: Union[Page, Frame], el_id: str) -> bool:
     return ctx.evaluate("""(id)=>{
       const el = document.getElementById(id);
       if(!el) return false;
@@ -436,7 +458,7 @@ def _click_by_id(ctx, el_id: str) -> bool:
       return true;
     }""", el_id)
 
-def _read_visible_panel(ctx) -> Optional[Dict[str, Any]]:
+def _read_visible_panel(ctx: Union[Page, Frame]) -> Optional[Dict[str, Any]]:
     for _ in range(PANEL_RETRIES):
         panel = ctx.evaluate(r"""() => {
           const panels = Array.from(document.querySelectorAll('.ConteneurCours'));
@@ -455,7 +477,7 @@ def _read_visible_panel(ctx) -> Optional[Dict[str, Any]]:
         time.sleep(PANEL_WAIT_MS/1000.0)
     return None
 
-def _collect_pairs_by_proximity(ctx) -> List[Dict[str, str]]:
+def _collect_pairs_by_proximity(ctx: Union[Page, Frame]) -> List[Dict[str, str]]:
     return ctx.evaluate(r"""() => {
       const cours = Array.from(document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')).map(e=>({id:e.id, r:e.getBoundingClientRect()}));
       const conts = Array.from(document.querySelectorAll('[id^="id_"][id*="_cont"]')).map(e=>({id:e.id, r:e.getBoundingClientRect(), text:(e.innerText||'').replace(/\s+/g,' ').trim()}));
@@ -480,21 +502,27 @@ def _collect_pairs_by_proximity(ctx) -> List[Dict[str, str]]:
       return out;
     }""")
 
-def extract_week_info(pronote_page) -> Dict[str, Any]:
-    ctx = wait_timetable_any(pronote_page, timeout_ms=30_000)
-    header_text = ctx.evaluate(r"""
-      () => {
-        const txt = (document.body.innerText || '').replace(/\s+/g,' ');
-        const m = txt.match(/du\s+(\d{2})\/(\d{2})\/(\d{4})\s+au\s+\d{2}\/\d{2}\/\d{4}/i);
-        return m ? m[0] : '';
-      }
-    """)
+def _read_week_header(ctx: Union[Page, Frame]) -> str:
+    # Cherche 'du dd/mm[/yy|yyyy] au dd/mm[/yy|yyyy]' partout, y compris onglets
+    try:
+        return ctx.evaluate(r"""() => {
+          const txt = (document.body.innerText || '').replace(/\s+/g,' ');
+          const m = txt.match(/du\s+\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\s+au\s+\d{1,2}\/\d{1,2}(?:\/\d{2,4})?/i);
+          return m ? m[0] : '';
+        }""")
+    except Exception:
+        return ""
+
+def extract_week_info(ctx: Union[Page, Frame]) -> Dict[str, Any]:
+    header_text = _read_week_header(ctx)
 
     monday: Optional[datetime] = None
     try:
-        m = re.search(r'du\s+(\d{2})/(\d{2})/(\d{4})', header_text or '', flags=re.IGNORECASE)
+        m = re.search(r'du\s+(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?', header_text or '', flags=re.IGNORECASE)
         if m:
-            monday = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            y = int(m.group(3)) if m.group(3) else datetime.now().year
+            if y < 100: y += 2000
+            monday = datetime(y, int(m.group(2)), int(m.group(1)))
     except Exception:
         monday = None
 
@@ -573,7 +601,7 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
 
     if not tiles:
         pairs = _collect_pairs_by_proximity(ctx)
-        _safe_write(f"{SCREEN_DIR}/edp_pairs_preview.json", json.dumps(pairs[:15], ensure_ascii=False, indent=2))
+        _safe_write(f"{SCREEN_DIR}/edp_pairs_preview.json", json.dumps(pairs[:20], ensure_ascii=False, indent=2))
         for t in pairs:
             aria = t.get("aria","")
             cont = t.get("cont","")
@@ -628,6 +656,7 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
     _safe_write(f"{SCREEN_DIR}/edp_debug_summary.json", json.dumps({
         "header": header_text, 
         "monday": monday.isoformat() if monday else None,
+        "click_ids": ids[:lim] if ids else [],
         "total_tiles": len(tiles)
     }, ensure_ascii=False, indent=2))
 
@@ -648,18 +677,18 @@ def run() -> None:
 
         log("Connexion ENT..."); login_ent(page)
         log("Ouverture PRONOTE..."); pronote = open_pronote(context, page)
-        log("Navigation vers 'Emploi du temps'..."); goto_timetable(pronote)
+        log("Navigation vers 'Emploi du temps'..."); ctx = goto_timetable(pronote)
 
         start_idx = max(1, FETCH_WEEKS_FROM)
         end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
 
         for week_idx in range(start_idx, end_idx + 1):
             log(f"-> Selection Semaine index={week_idx} via css '{WEEK_TAB_TEMPLATE.format(n=week_idx)}'")
-            used_tab = goto_week_by_index(pronote, week_idx)
-            accept_cookies_any(pronote); ensure_all_visible(pronote)
-            _safe_shot(pronote, f"08-week-{week_idx}-after-select")
+            used_tab = goto_week_by_index(ctx, week_idx)
+            accept_cookies_any(pronote); ensure_all_visible(ctx)
+            _safe_shot(ctx, f"08-week-{week_idx}-after-select")
 
-            info  = extract_week_info(pronote)
+            info  = extract_week_info(ctx)
             tiles = info["tiles"] or []
             hdr   = (info.get("header") or "").replace("\\n", " ")[:160]
             log(f"Semaine {week_idx}: {len(tiles)} cases, header='{hdr}'")
@@ -690,11 +719,11 @@ def run() -> None:
                     log(f"[GCAL] {e}")
 
             if week_idx < end_idx:
-                clicked = click_first_any(pronote, [
-                    'button[title*="suivante"]','button[aria-label*="suivante"]','a:has-text("Semaine suivante")'
-                ])
+                clicked = click_css_any(ctx, 'button[title*="suivante"]') or \
+                          click_css_any(ctx, 'button[aria-label*="suivante"]') or \
+                          click_css_any(ctx, 'a:has-text("Semaine suivante")')
                 if clicked:
-                    wait_timetable_any(pronote); _safe_shot(pronote, "09-next-week")
+                    find_timetable_ctx(pronote); _safe_shot(ctx, "09-next-week")
                 else:
                     break
 
