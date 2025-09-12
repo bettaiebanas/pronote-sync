@@ -266,7 +266,8 @@ def click_css_any(page, css: str, screenshot_tag: str = "") -> bool:
 def login_ent(page) -> None:
     _safe_mkdir(SCREEN_DIR)
     page.set_default_timeout(TIMEOUT_MS)
-    page.goto(ENT_URL, wait_until("load"))
+    page.goto(ENT_URL)
+    page.wait_for_load_state("load")
     page.wait_for_load_state("domcontentloaded")
     accept_cookies_any(page)
     _safe_shot(page, "01-ent-welcome")
@@ -330,9 +331,11 @@ def open_pronote(context, page):
             _safe_shot(page, "06-pronote-tile-not-found")
             raise RuntimeError("Tuile PRONOTE introuvable.")
     try:
-        pronote_page = p.value; pronote_page.wait_for_load_state("domcontentloaded")
+        pronote_page = p.value
+        pronote_page.wait_for_load_state("domcontentloaded")
     except PWTimeout:
-        pronote_page = page; pronote_page.wait_for_load_state("domcontentloaded")
+        pronote_page = page
+        pronote_page.wait_for_load_state("domcontentloaded")
     accept_cookies_any(pronote_page)
     _safe_shot(pronote_page, "07-pronote-home")
     return pronote_page
