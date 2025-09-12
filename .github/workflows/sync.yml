@@ -1,47 +1,86 @@
-# -*- coding: utf-8 -*-
-"""
-Petit wrapper utilitaire : journalise l'environnement, prépare les fichiers OAuth
-si fournis, puis lance le script PRONOTE. Le workflow ci-dessus peut appeler directement
-pronote_playwright_to_family_mo.py ; ce wrapper est facultatif.
-"""
-import os, subprocess, sys
+name: pronote-to-family-mo (Playwright)
 
-def log(msg): print(msg, flush=True)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '5 6,16 * * *'   # 06:05 et 16:05 UTC ≈ 08:05/18:05 Paris
 
-def main():
-    log("=== sync.py: preparing execution ===")
-    # Fichiers OAuth si Secrets présents
-    c = os.getenv("GCAL_CLIENT_SECRET", "")
-    t = os.getenv("GCAL_TOKEN_JSON", "")
-    if c:
-        open("credentials.json","w", encoding="utf-8").write(c)
-        log("[CFG] credentials.json écrit (via secret).")
-    else:
-        log("[CFG] GCAL_CLIENT_SECRET absent - pas d'écriture de credentials.json")
+jobs:
+  sync:
+    runs-on: [self-hosted, Windows]
 
-    if t:
-        open("token.json","w", encoding="utf-8").write(t)
-        log("[CFG] token.json écrit (via secret).")
-    else:
-        log("[CFG] GCAL_TOKEN_JSON absent - pas d'écriture de token.json")
+    defaults:
+      run:
+        shell: powershell
 
-    # Affiche les clés (présence uniquement)
-    keys = ["PRONOTE_USER","PRONOTE_PASS","ENT_URL","PRONOTE_URL","TIMETABLE_PRE_SELECTOR",
-            "TIMETABLE_SELECTOR","TIMETABLE_FRAME","WEEK_TAB_TEMPLATE","FETCH_WEEKS_FROM",
-            "WEEKS_TO_FETCH","HEADFUL","CALENDAR_ID"]
-    log("[DBG] Env keys (presence only):")
-    for k in keys:
-        v = os.getenv(k)
-        log(f"  - {k}: {'YES' if v else 'NO'}")
+    env:
+      PRONOTE_USER: ${{ secrets.PRONOTE_USER }}
+      PRONOTE_PASS: ${{ secrets.PRONOTE_PASS }}
+      CALENDAR_ID:  family15066434840617961429@group.calendar.google.com
+      ENT_URL:      https://ent77.seine-et-marne.fr/welcome
+      PRONOTE_URL:  "https://0771342r.index-education.net/pronote/parent.html"
+      HEADFUL:      "1"                  # mets "1" pour voir le navigateur sur le runner
+      TIMETABLE_PRE_SELECTOR: '#GInterface\.Instances\[0\]\.Instances\[1\]_Combo5'
+      TIMETABLE_SELECTOR:     '#GInterface\.Instances\[0\]\.Instances\[1\]_Liste_niveau5 > ul > li:nth-child(1) > div > div'
+      TIMETABLE_FRAME:        'parent.html'   # optionnel; mets '' si inutile
+      # Onglets "Semaine 1/2/3…"
+      WEEK_TAB_TEMPLATE: '#GInterface\.Instances\[2\]\.Instances\[0\]_j_{n}'
+      FETCH_WEEKS_FROM: '1'     # commence à j_1
+      WEEKS_TO_FETCH:   '4'     # j_1, j_2, j_3,j_4
+      
+      # Petits timers confort
+      WAIT_AFTER_NAV_MS: '1000'   # pause après chaque clic critique
+      CLICK_TOUT_VOIR:   '1'      # clic auto sur “Tout voir”
 
-    # Lancer le script principal
-    py = sys.executable
-    cmd = [py, os.path.abspath("pronote_playwright_to_family_mo.py")]
-    log("=== Launching pronote_playwright_to_family_mo.py ===")
-    rc = subprocess.call(cmd)
-    if rc != 0:
-        log(f"[FATAL] pronote script exited with code {rc}")
-        sys.exit(rc)
+    steps:
+      - uses: actions/checkout@v4
 
-if __name__ == "__main__":
-    main()
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: 'x64'
+
+      - name: Jitter aléatoire (30s–5min)
+        run: Start-Sleep -Seconds (Get-Random -Minimum 30 -Maximum 300)
+
+      - name: IP publique du job
+        run: |
+          try {
+            $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json').ip
+            Write-Host "IP publique du job: $ip"
+          } catch {
+            Write-Host "IP non récupérée: $($_.Exception.Message)"
+          }
+
+      - name: Recréer OAuth Google (depuis secrets)
+        run: |
+          Set-Content -Path credentials.json -Value '${{ secrets.GCAL_CLIENT_SECRET }}' -NoNewline
+          Set-Content -Path token.json        -Value '${{ secrets.GCAL_TOKEN_JSON }}'  -NoNewline
+
+      - name: Bootstrap pip (toolcache Windows)
+        run: |
+          & "$env:pythonLocation\python.exe" -V
+          & "$env:pythonLocation\python.exe" -m ensurepip --upgrade
+          & "$env:pythonLocation\python.exe" -m pip --version
+          & "$env:pythonLocation\python.exe" -m pip install --upgrade pip setuptools wheel
+
+      - name: Installer dépendances Python
+        run: |
+          & "$env:pythonLocation\python.exe" -m pip install playwright google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dateutil
+
+      - name: Installer Chromium (Playwright)
+        run: |
+          & "$env:pythonLocation\python.exe" -m playwright install chromium
+
+      - name: Lancer la synchro Playwright -> Google Calendar
+        run: |
+          New-Item -ItemType Directory -Force -Path screenshots | Out-Null
+          & "$env:pythonLocation\python.exe" .\pronote_playwright_to_family_mo.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/**
+          if-no-files-found: ignore
