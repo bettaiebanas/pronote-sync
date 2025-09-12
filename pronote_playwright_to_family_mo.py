@@ -412,23 +412,25 @@ def _click_candidate(ctx, sel: str, idx: int) -> bool:
       return true;
     }""", {"sel": sel, "i": idx})
 
+
 def _read_visible_panel(ctx) -> Optional[Dict[str, Any]]:
+    # Ne filtre plus par offsetParent (les panneaux PRONOTE peuvent être en position:fixed)
     for _ in range(PANEL_RETRIES):
         panel = ctx.evaluate(r"""() => {
-          const vis = e => e && getComputedStyle(e).display!=='none' && e.offsetParent!==null;
-          const panels = Array.from(document.querySelectorAll('.ConteneurCours')).filter(vis);
+          const panels = Array.from(document.querySelectorAll('.ConteneurCours'));
           if (!panels.length) return null;
           const p = panels[panels.length-1];
           const header = (p.querySelector('.EnteteCoursLibelle')?.innerText||'').replace(/\s+/g,' ').trim();
-          if (!header) return null;
+          // Même si le panneau est "masqué" par offsetParent null, on lit quand même le contenu.
           const groups = Array.from(p.querySelectorAll('[role="group"]'));
           const pick = (name) => {
             const g = groups.find(x => (x.getAttribute('aria-label')||'').toLowerCase().includes(name));
             return g ? (g.innerText||'').replace(/\s+/g,' ').trim() : '';
           };
-          return { header, matiere: pick('matière') || pick('matiere'), salle: pick('salles') || pick('salle') };
+          return header ? { header, matiere: pick('matière') || pick('matiere'), salle: pick('salles') || pick('salle') } : null;
         }""")
-        if panel: return panel
+        if panel: 
+            return panel
         time.sleep(PANEL_WAIT_MS/1000.0)
     return None
 
@@ -524,7 +526,17 @@ def extract_week_info(pronote_page) -> Dict[str, Any]:
             times = parse_times(aria)
             if not (times["start"] or times["end"]):
                 continue
-            dt_date = parse_date_from_text(aria, fallback_year=year) or monday
+            dt_date = parse_date_from_text(aria, fallback_year=year)
+            # If no explicit dd/mm date, infer from weekday relative to 'monday' header
+            if not dt_date and monday:
+                text_l = (aria or '').lower()
+                jours = ['lundi','mardi','mercredi','jeudi','vendredi','samedi','dimanche']
+                found = next((i for i,n in enumerate(jours) if n in text_l), None)
+                if found is not None:
+                    dt_date = monday + timedelta(days=found)
+            # As a very last resort, keep monday (less accurate but avoids crash)
+            if not dt_date:
+                dt_date = monday
             if not dt_date:
                 continue
             start_hm = times["start"]; end_hm = times["end"]
