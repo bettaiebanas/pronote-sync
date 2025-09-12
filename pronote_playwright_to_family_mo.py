@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os, re, sys, time, json, hashlib, unicodedata
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List, Union, Tuple
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Frame
 from google.oauth2.credentials import Credentials
@@ -106,7 +106,7 @@ def make_dedupe_key(start: datetime, end: datetime, title: str, location: str) -
     key = f"{start.isoformat()}|{end.isoformat()}|{_norm(title)}|{_norm(location)}"
     return hashlib.sha1(key.encode()).hexdigest()
 
-def upsert_event_by_dedupe(svc, cal_id: str, body: Dict[str, Any], dedupe_key: str) -> str:
+def upsert_event_by_dedupe(svc, cal_id: str, body: Dict[str, Any], dedupe_key: str) -> Tuple[str, Dict[str, Any]]:
     # Recherche par extendedProperties.private.dedupe
     try:
         existing = svc.events().list(
@@ -124,13 +124,13 @@ def upsert_event_by_dedupe(svc, cal_id: str, body: Dict[str, Any], dedupe_key: s
 
     if items:
         ev_id = items[0]["id"]
-        svc.events().patch(calendarId=cal_id, eventId=ev_id, body=body, sendUpdates="none").execute()
-        return "updated"
+        ev = svc.events().patch(calendarId=cal_id, eventId=ev_id, body=body, sendUpdates="none").execute()
+        return "updated", ev
     else:
-        svc.events().insert(calendarId=cal_id, body=body, sendUpdates="none").execute()
-        return "created"
+        ev = svc.events().insert(calendarId=cal_id, body=body, sendUpdates="none").execute()
+        return "created", ev
 
-# ===================== Parsing (identique) =====================
+# ===================== Parsing =====================
 H_PATTERNS = [
     re.compile(r'(?P<h>\d{1,2})\s*[hH:]\s*(?P<m>\d{2})'),
     re.compile(r'(?P<h>\d{1,2})\s*(?:heures?|hrs?)\s*(?P<m>\d{2})', re.IGNORECASE)
@@ -196,7 +196,7 @@ def parse_panel(panel: Dict[str, Any], year: int) -> Optional[Dict[str, Any]]:
         if m: salle = m.group(1).strip()
     return {"summary": summary, "room": salle, "start_dt": start_dt, "end_dt": end_dt}
 
-# ===================== Playwright helpers (inchangés vs dernière version) =====================
+# ===================== Playwright helpers =====================
 def _iter_contexts(page: Page):
     yield page
     for fr in page.frames: yield fr
@@ -656,7 +656,24 @@ def run() -> None:
         raise SystemExit("PRONOTE_USER / PRONOTE_PASS manquants.")
 
     svc = get_gcal_service()
+
+    # --- Qui suis-je, et quel calendrier ?
+    try:
+        me_primary = svc.calendars().get(calendarId="primary").execute()
+    except Exception:
+        me_primary = {}
+    try:
+        cal_meta = svc.calendars().get(calendarId=CALENDAR_ID).execute()
+    except Exception as e:
+        cal_meta = {"error": str(e)}
+
+    _safe_write(f"{SCREEN_DIR}/gcal_whoami.json", json.dumps({
+        "primary": me_primary, "target_calendar": cal_meta
+    }, ensure_ascii=False, indent=2))
+    log(f"[GCAL] Using calendar '{cal_meta.get('summary','?')}' (id={CALENDAR_ID}) as {me_primary.get('id','?')}")
+
     created = updated = 0
+    created_events_dump: List[Dict[str, Any]] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not HEADFUL, args=["--disable-dev-shm-usage"])
@@ -669,6 +686,9 @@ def run() -> None:
 
         start_idx = max(1, FETCH_WEEKS_FROM)
         end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
+
+        overall_min_dt: Optional[datetime] = None
+        overall_max_dt: Optional[datetime] = None
 
         for week_idx in range(start_idx, end_idx + 1):
             log(f"-> Selection Semaine index={week_idx} via css '{WEEK_TAB_TEMPLATE.format(n=week_idx)}'")
@@ -700,11 +720,23 @@ def run() -> None:
                     "extendedProperties": {"private": {"source": "pronote_playwright", "dedupe": dedupe}}
                 }
                 try:
-                    action = upsert_event_by_dedupe(svc, CALENDAR_ID, body, dedupe)
+                    action, ev = upsert_event_by_dedupe(svc, CALENDAR_ID, body, dedupe)
                     if action == "created": created += 1
                     else: updated += 1
+                    created_events_dump.append({
+                        "action": action,
+                        "summary": ev.get("summary"),
+                        "start": ev.get("start"),
+                        "end": ev.get("end"),
+                        "htmlLink": ev.get("htmlLink"),
+                        "id": ev.get("id"),
+                    })
                 except HttpError as e:
                     log(f"[GCAL] {e}")
+
+                # bornes pour la vérif finale
+                overall_min_dt = min(overall_min_dt or start_dt, start_dt)
+                overall_max_dt = max(overall_max_dt or end_dt,   end_dt)
 
             if week_idx < end_idx:
                 clicked = click_css_any(ctx, 'button[title*="suivante"]') or \
@@ -716,7 +748,28 @@ def run() -> None:
                     break
 
         browser.close()
-    log(f"Termine. crees={created}, maj={updated}")
+
+    _safe_write(f"{SCREEN_DIR}/gcal_created_events.json", json.dumps(created_events_dump, ensure_ascii=False, indent=2))
+
+    # --- Vérification finale dans le calendrier ciblé
+    verified_count = 0
+    if overall_min_dt and overall_max_dt:
+        try:
+            ver = svc.events().list(
+                calendarId=CALENDAR_ID,
+                timeMin=(overall_min_dt - timedelta(days=1)).isoformat(),
+                timeMax=(overall_max_dt + timedelta(days=1)).isoformat(),
+                singleEvents=True,
+                showDeleted=False,
+                maxResults=2500,
+                privateExtendedProperty="source=pronote_playwright"
+            ).execute()
+            verified_count = len(ver.get("items", []))
+            _safe_write(f"{SCREEN_DIR}/gcal_search_after_run.json", json.dumps(ver, ensure_ascii=False, indent=2))
+        except Exception as e:
+            log(f"[GCAL VERIFY] {e}")
+
+    log(f"Termine. crees={created}, maj={updated}, verif_trouves={verified_count}")
 
 if __name__ == "__main__":
     try:
