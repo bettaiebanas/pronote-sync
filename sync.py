@@ -1,4 +1,5 @@
 # sync.py — orchestrateur pour pronote_playwright_to_family_mo.py
+# ASCII-only logs to avoid UnicodeEncodeError on Windows consoles.
 
 import os
 import sys
@@ -10,32 +11,35 @@ import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-PY   = sys.executable  # Python courant (celui de setup-python sur le runner)
+PY   = sys.executable  # Python used by setup-python on the runner
 
 def log(msg):
-    print(msg, flush=True)
+    """Print in a console-safe way (ASCII only)."""
+    try:
+        # keep it simple and safe for cp1252 consoles
+        print(str(msg).encode("ascii", "replace").decode("ascii"), flush=True)
+    except Exception:
+        # last resort
+        print(str(msg), flush=True)
 
 def run(cmd, check=True):
-    """Exécute un processus enfant en affichant la commande."""
-    if isinstance(cmd, list):
-        show = " ".join(cmd)
-    else:
-        show = cmd
-    log(f"[RUN] {show}")
+    """Run a subprocess, printing the command."""
+    show = " ".join(cmd) if isinstance(cmd, list) else cmd
+    log("[RUN] " + show)
     return subprocess.run(cmd, check=check)
 
 def write_if_env(env_name, dest_path):
-    """Écrit le fichier dest_path si la variable d'env est définie."""
+    """Write dest_path if the env var is present."""
     val = os.getenv(env_name)
     if not val:
-        log(f"[CFG] {env_name}: (absent) – je n'écris pas {dest_path}")
+        log(f"[CFG] {env_name}: (absent) - not writing {dest_path}")
         return False
     Path(dest_path).write_text(val, encoding="utf-8")
-    log(f"[CFG] {env_name}: écrit -> {dest_path}")
+    log(f"[CFG] {env_name}: written -> {dest_path}")
     return True
 
 def ensure_pip():
-    """S’assure que pip est disponible et à jour."""
+    """Ensure pip is present and up to date."""
     try:
         run([PY, "-m", "ensurepip", "--upgrade"], check=False)
     except Exception as e:
@@ -47,7 +51,7 @@ def ensure_pip():
         log(f"[WARN] upgrade pip: {e}")
 
 def pip_install():
-    """Installe les libs nécessaires au script Pronote."""
+    """Install libs required by the Pronote script."""
     pkgs = [
         "playwright",
         "google-api-python-client",
@@ -58,8 +62,20 @@ def pip_install():
     run([PY, "-m", "pip", "install", "-q"] + pkgs, check=True)
 
 def playwright_install_browsers():
-    """Installe Chromium pour Playwright (nécessaire côté runner Windows)."""
+    """Install Chromium for Playwright."""
     run([PY, "-m", "playwright", "install", "chromium"], check=True)
+
+def ascii_sample(s, maxlen=80):
+    """Return a short ASCII-safe sample of a string."""
+    if s is None:
+        return ""
+    try:
+        s = str(s)
+        if len(s) > maxlen:
+            s = s[:maxlen] + "..."
+        return s.encode("ascii", "replace").decode("ascii")
+    except Exception:
+        return "<non-printable>"
 
 def show_env_debug():
     keys = [
@@ -70,58 +86,56 @@ def show_env_debug():
         "HEADFUL", "CALENDAR_ID",
         "GCAL_CLIENT_SECRET", "GCAL_TOKEN_JSON",
     ]
-    log("[DBG] Environnement (présence des clés seulement) :")
+    log("[DBG] Env keys (presence only):")
     for k in keys:
-        present = "✅" if os.getenv(k) else "—"
+        present = "YES" if os.getenv(k) else "NO"
         if k in ("PRONOTE_PASS", "GCAL_CLIENT_SECRET", "GCAL_TOKEN_JSON"):
             log(f"   - {k}: {present}")
         else:
-            v = os.getenv(k, "")
-            if len(v) > 80:
-                v = v[:80] + "…"
-            log(f"   - {k}: {present} {v!r}")
+            v = ascii_sample(os.getenv(k, ""))
+            log(f"   - {k}: {present} '{v}'")
 
 def main():
-    log("=== sync.py : préparation de l’exécution ===")
+    log("=== sync.py: preparing execution ===")
 
-    # 1) Credentials OAuth Google (depuis secrets)
+    # 1) OAuth credentials (from secrets)
     wrote_cred = write_if_env("GCAL_CLIENT_SECRET", ROOT / "credentials.json")
     wrote_tok  = write_if_env("GCAL_TOKEN_JSON",   ROOT / "token.json")
     if not wrote_cred:
-        log("[INFO] Pas de GCAL_CLIENT_SECRET dans l’env – si le token.json est déjà valide, ça passe quand même.")
+        log("[INFO] GCAL_CLIENT_SECRET not provided - if token.json is valid, that is fine.")
     if not wrote_tok:
-        log("[INFO] Pas de GCAL_TOKEN_JSON dans l’env – le script fera le flux OAuth local si besoin (HEADFUL conseillé).")
+        log("[INFO] GCAL_TOKEN_JSON not provided - script may trigger local OAuth flow if needed.")
 
-    # 2) Pip + dépendances
+    # 2) Pip + deps
     ensure_pip()
     pip_install()
 
-    # 3) Navigateurs Playwright
+    # 3) Playwright browsers
     playwright_install_browsers()
 
-    # 4) Un peu de debug côté env
+    # 4) Debug env (ASCII)
     show_env_debug()
 
-    # 5) Lancement du script principal
+    # 5) Launch main script
     target = ROOT / "pronote_playwright_to_family_mo.py"
     if not target.exists():
-        log(f"[FATAL] Fichier introuvable: {target}")
+        log(f"[FATAL] Missing file: {target}")
         sys.exit(2)
 
-    log("=== Lancement de pronote_playwright_to_family_mo.py ===")
+    log("=== Launching pronote_playwright_to_family_mo.py ===")
     try:
         run([PY, str(target)], check=True)
-        log("=== Exécution terminée sans erreur côté script Pronote ===")
+        log("=== Script finished without error ===")
     except subprocess.CalledProcessError as cpe:
-        log(f"[FATAL] Le script Pronote a renvoyé un code ≠ 0 ({cpe.returncode}).")
+        log(f"[FATAL] Pronote script returned non-zero code ({cpe.returncode}).")
         sys.exit(cpe.returncode)
 
 if __name__ == "__main__":
     try:
         main()
-    except SystemExit as se:
+    except SystemExit:
         raise
     except Exception:
-        log("[FATAL] Exception non gérée dans sync.py :")
+        log("[FATAL] Unhandled exception in sync.py:")
         traceback.print_exc()
         sys.exit(1)
