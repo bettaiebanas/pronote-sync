@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
-import os, re, sys, time, json, hashlib, unicodedata, random
+import os, re, sys, time, json, hashlib, unicodedata, random, math
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Union, Tuple
 
@@ -48,13 +48,23 @@ TIMEZONE         = "Europe/Paris"
 TIMEOUT_MS  = 120_000
 SCREEN_DIR  = "screenshots"
 
-# ====== Nettoyage intégré (retrait de préfixes comme [Mo]) ======
+# ====== Nettoyage titres (retrait de préfixes comme [Mo]) ======
 CLEAN_PREFIX_BEFORE_RUN = os.getenv("CLEAN_PREFIX_BEFORE_RUN","0") == "1"
 CLEAN_PREFIX_REGEX      = os.getenv("CLEAN_PREFIX_REGEX", r"\s*\[Mo\]\s*")
-CLEAN_ONLY_SOURCE       = os.getenv("CLEAN_ONLY_SOURCE","1") == "1"   # 1 = événements créés par ce script uniquement
+CLEAN_ONLY_SOURCE       = os.getenv("CLEAN_ONLY_SOURCE","1") == "1"
 CLEAN_PAST_DAYS         = int(os.getenv("CLEAN_PAST_DAYS","60"))
 CLEAN_FUTURE_DAYS       = int(os.getenv("CLEAN_FUTURE_DAYS","365"))
 CLEAN_DRY_RUN           = os.getenv("CLEAN_DRY_RUN","0") == "1"
+
+# ====== PURGE d'évènements (optionnel) ======
+PURGE_BEFORE_RUN          = os.getenv("PURGE_BEFORE_RUN","0") == "1"
+PURGE_SOURCE_ONLY         = os.getenv("PURGE_SOURCE_ONLY","1") == "1"
+PURGE_PAST_DAYS           = int(os.getenv("PURGE_PAST_DAYS","60"))
+PURGE_FUTURE_DAYS         = int(os.getenv("PURGE_FUTURE_DAYS","365"))
+PURGE_DRY_RUN             = os.getenv("PURGE_DRY_RUN","0") == "1"
+PURGE_DUPLICATES          = os.getenv("PURGE_DUPLICATES","1") == "1"   # supprime doublons en conservant 1 exemplaire
+DEDUP_TOLERANCE_MIN       = int(os.getenv("DEDUP_TOLERANCE_MIN","10"))  # tolérance horaires ±N min
+PURGE_DELETE_IF_CONTAINS  = os.getenv("PURGE_DELETE_IF_CONTAINS","").strip()  # ex: "réunion" (insensible à la casse)
 
 # ===================== Console UTF-8 =====================
 try:
@@ -95,8 +105,7 @@ def _last_sunday(year: int, month: int) -> datetime:
     return d
 
 def _paris_offset(dt: datetime) -> str:
-    start = _last_sunday(dt.year, 3)
-    end   = _last_sunday(dt.year, 10)
+    start = _last_sunday(dt.year, 3); end = _last_sunday(dt.year, 10)
     return "+02:00" if start <= dt <= end else "+01:00"
 
 def to_rfc3339_local(dt: datetime) -> str:
@@ -125,7 +134,6 @@ def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode()
     return re.sub(r"\s+"," ",s).strip().lower()
 
-# --- Statuts pour le suffixe du titre & regex pour les retirer du "cœur" du titre
 _STATUS_CANON = {
     "prof. absent": "Prof. absent",
     "prof absent": "Prof. absent",
@@ -142,8 +150,8 @@ _STATUS_RE = re.compile(r'\((?:prof\.?\s*absent|cours\s+annul[eé]|changement\s+
 
 def _title_core(title: str) -> str:
     t = title or ""
-    t = re.sub(r'^\s*\[[^\]]+\]\s*', '', t)  # enlève [XXX] au début
-    t = _STATUS_RE.sub('', t)                # enlève le suffixe (statut)
+    t = re.sub(r'^\s*\[[^\]]+\]\s*', '', t)
+    t = _STATUS_RE.sub('', t)
     return t.strip()
 
 def make_dedupe_key(start: datetime, end: datetime, title: str, location: str) -> str:
@@ -161,10 +169,23 @@ def _parse_gcal_dt(ev_dt: Dict[str, str]) -> Optional[datetime]:
         try: return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
         except Exception: return None
 
+def _strip_prefix_for_compare(summary: str, rx_prefix: Optional[re.Pattern]) -> str:
+    if not summary: return ""
+    s = summary
+    if rx_prefix: s = rx_prefix.sub(" ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return _title_core(s)
+
+def _round_min(dt: datetime, tol_min: int) -> datetime:
+    if tol_min <= 0: return dt
+    q = tol_min * 60
+    epoch = int(dt.timestamp())
+    r = int(round(epoch / q) * q)
+    return datetime.fromtimestamp(r)
+
 def _find_existing_event(svc, cal_id: str, body: Dict[str, Any], title: str, location: str, dedupe_key: str):
     start = datetime.fromisoformat(body["start"]["dateTime"])
     end   = datetime.fromisoformat(body["end"]["dateTime"])
-    # 1) par clé dedupe
     try:
         res = svc.events().list(
             calendarId=cal_id,
@@ -176,7 +197,6 @@ def _find_existing_event(svc, cal_id: str, body: Dict[str, Any], title: str, loc
         items = res.get("items", [])
         if items: return items[0]
     except HttpError: pass
-    # 2) compat : même source, cœur titre + salle + créneau ~
     try:
         res = svc.events().list(
             calendarId=cal_id,
@@ -215,15 +235,103 @@ def upsert_event_by_dedupe(svc, cal_id: str, body: Dict[str, Any], dedupe_key: s
                 log("[GCAL] Rate limit — retry..."); _backoff_sleep(i); continue
             raise
 
-# ===================== Nettoyage GCal (prefix) =====================
+# ===================== PURGE GCAL =====================
+def _list_events_window(svc, cal_id: str, time_min: datetime, time_max: datetime, only_source: bool) -> List[Dict[str,Any]]:
+    items: List[Dict[str,Any]] = []
+    page_token = None
+    while True:
+        params = dict(
+            calendarId=cal_id,
+            timeMin=to_rfc3339_local(time_min),
+            timeMax=to_rfc3339_local(time_max),
+            singleEvents=True, showDeleted=False, maxResults=250
+        )
+        if only_source:
+            params["privateExtendedProperty"] = "source=pronote_playwright"
+        if page_token:
+            params["pageToken"] = page_token
+        resp = svc.events().list(**params).execute()
+        items.extend(resp.get("items", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token: break
+    return items
+
+def purge_calendar_events(svc, cal_id: str,
+                          time_min: datetime, time_max: datetime,
+                          only_source: bool = True,
+                          delete_if_contains: str = "",
+                          dedup: bool = True,
+                          tol_min: int = 10,
+                          dry_run: bool = False,
+                          clean_prefix_regex: str = r"\s*\[Mo\]\s*") -> Dict[str,int]:
+    """
+    - delete_if_contains: si non vide, supprime les events dont le titre (après retrait du préfixe) contient ce motif (insensible à la casse)
+    - dedup: si True, supprime les doublons (même cœur de titre + salle + horaire ± tolérance), en conservant 1 exemplaire
+    """
+    rx_prefix = re.compile(clean_prefix_regex, re.I) if clean_prefix_regex else None
+    motif = delete_if_contains.lower().strip()
+    events = _list_events_window(svc, cal_id, time_min, time_max, only_source)
+
+    deleted = 0
+    scanned = len(events)
+
+    # 1) Suppression par mot-clé
+    to_delete_ids: set[str] = set()
+    if motif:
+        for ev in events:
+            core = _strip_prefix_for_compare(ev.get("summary",""), rx_prefix).lower()
+            if motif in core:
+                to_delete_ids.add(ev["id"])
+
+    # 2) Déduplication
+    if dedup:
+        groups: Dict[Tuple[str,str,datetime,datetime], List[Dict[str,Any]]] = {}
+        for ev in events:
+            if ev["id"] in to_delete_ids:  # déjà prévu à suppression
+                continue
+            start = _parse_gcal_dt(ev.get("start", {}))
+            end   = _parse_gcal_dt(ev.get("end", {}))
+            if not (start and end): 
+                continue
+            kcore = _norm(_strip_prefix_for_compare(ev.get("summary",""), rx_prefix))
+            kloc  = _norm(ev.get("location",""))
+            kstart = _round_min(start, tol_min)
+            kend   = _round_min(end, tol_min)
+            key = (kcore, kloc, kstart, kend)
+            groups.setdefault(key, []).append(ev)
+
+        for key, lst in groups.items():
+            if len(lst) <= 1: 
+                continue
+            # garde le plus ancien (created) et supprime le reste
+            lst_sorted = sorted(lst, key=lambda e: e.get("created","") or e.get("updated",""))
+            keep = lst_sorted[0]["id"]
+            for ev in lst_sorted[1:]:
+                to_delete_ids.add(ev["id"])
+
+    # 3) Exécution suppressions
+    for ev_id in to_delete_ids:
+        if dry_run:
+            log(f"[PURGE DRY] delete {ev_id}")
+            continue
+        tries = 0
+        while True:
+            try:
+                svc.events().delete(calendarId=cal_id, eventId=ev_id, sendUpdates="none").execute()
+                deleted += 1
+                break
+            except HttpError as e:
+                if getattr(e, "res", None) and e.res.status in (403,429):
+                    _backoff_sleep(tries); tries += 1; continue
+                raise
+
+    return {"scanned": scanned, "deleted": deleted}
+
+# ===================== Nettoyage GCAL (retirer préfixe dans titres) =====================
 def strip_calendar_prefixes(svc, cal_id: str,
                             time_min: datetime, time_max: datetime,
                             regex: str, only_source: bool = True,
                             dry_run: bool = False) -> tuple[int,int]:
-    """
-    Retire le préfixe (regex) dans les titres des événements Google Calendar
-    sur la plage [time_min, time_max]. Retourne (scannes, modifies).
-    """
     rx = re.compile(regex, re.I)
     total = changed = 0
     page_token = None
@@ -265,9 +373,7 @@ def strip_calendar_prefixes(svc, cal_id: str,
                             break
                         except HttpError as e:
                             if getattr(e, "res", None) and e.res.status in (403, 429):
-                                time.sleep(min(30, (2**tries) + random.uniform(0,0.5)))
-                                tries += 1
-                                continue
+                                _backoff_sleep(tries); tries += 1; continue
                             raise
 
         page_token = resp.get("nextPageToken")
@@ -276,7 +382,7 @@ def strip_calendar_prefixes(svc, cal_id: str,
 
     return total, changed
 
-# ===================== Parsing =====================
+# ===================== Parsing PRONOTE =====================
 H_PATTERNS = [
     re.compile(r'(?P<h>\d{1,2})\s*[hH:]\s*(?P<m>\d{2})'),
     re.compile(r'(?P<h>\d{1,2})\s*(?:heures?|hrs?)\s*(?P<m>\d{2})', re.IGNORECASE)
@@ -574,7 +680,6 @@ def goto_week_by_index(pronote_page: Page, current_ctx: Union[Page, Frame], n: i
     css = WEEK_TAB_TEMPLATE.format(n=n)
     click_css_any(current_ctx, css, f"week-{n}")
     grid = find_dom_grid_ctx(pronote_page, prefer=current_ctx, timeout_ms=5000) or current_ctx
-    # Attente robuste que la grille soit présente
     end = time.time() + WEEK_HARD_TIMEOUT_MS/1000.0
     while time.time() < end:
         try:
@@ -592,7 +697,7 @@ def goto_week_by_index(pronote_page: Page, current_ctx: Union[Page, Frame], n: i
         grid = find_dom_grid_ctx(pronote_page, prefer=grid, timeout_ms=1500) or grid
     return grid
 
-# ===================== Extraction =====================
+# ===================== Extraction PRONOTE =====================
 def _list_course_ids(ctx: Union[Page, Frame]) -> List[str]:
     try:
         ids = ctx.evaluate(r"""() => {
@@ -829,7 +934,27 @@ def run() -> None:
     _safe_write(f"{SCREEN_DIR}/gcal_whoami.json", json.dumps({"primary": me_primary, "target_calendar": cal_meta}, ensure_ascii=False, indent=2))
     log(f"[GCAL] Using calendar '{cal_meta.get('summary','?')}' (id={CALENDAR_ID}) as {me_primary.get('id','?')}")
 
-    # --- Nettoyage optionnel AVANT insertion
+    # --- PURGE optionnelle (avant import)
+    if PURGE_BEFORE_RUN:
+        now = datetime.now()
+        tmin = now - timedelta(days=PURGE_PAST_DAYS)
+        tmax = now + timedelta(days=PURGE_FUTURE_DAYS)
+        log(f"[PURGE] window {tmin.date()} -> {tmax.date()} (ONLY_SOURCE={PURGE_SOURCE_ONLY}, DUPL={PURGE_DUPLICATES}, CONTAINS='{PURGE_DELETE_IF_CONTAINS}', DRY={PURGE_DRY_RUN})")
+        try:
+            res = purge_calendar_events(
+                svc, CALENDAR_ID, tmin, tmax,
+                only_source=PURGE_SOURCE_ONLY,
+                delete_if_contains=PURGE_DELETE_IF_CONTAINS,
+                dedup=PURGE_DUPLICATES,
+                tol_min=DEDUP_TOLERANCE_MIN,
+                dry_run=PURGE_DRY_RUN,
+                clean_prefix_regex=CLEAN_PREFIX_REGEX
+            )
+            log(f"[PURGE] Scannés={res['scanned']} — Supprimés={res['deleted']}")
+        except Exception as e:
+            log(f"[PURGE] Erreur: {e}")
+
+    # --- Nettoyage titres optionnel (retire [Mo])
     if CLEAN_PREFIX_BEFORE_RUN:
         now = datetime.now()
         tmin = now - timedelta(days=CLEAN_PAST_DAYS)
@@ -884,7 +1009,6 @@ def run() -> None:
                     if end_dt < (now - timedelta(days=60)) or start_dt > (now + timedelta(days=180)): 
                         continue
 
-                    # Statut (suffixe de titre) depuis le texte du panneau
                     ph = " ".join([t.get("panel_text","") or "", t.get("panel_header","") or "", t.get("label","") or ""]).lower()
                     status_tag = ""
                     for k, canon in _STATUS_CANON.items():
@@ -947,7 +1071,7 @@ def run() -> None:
 
 if __name__ == "__main__":
     try:
-        _safe_mkdir(SCREEN_DIR)  # assure le dossier screenshots
+        _safe_mkdir(SCREEN_DIR)
         run()
     except Exception as ex:
         _safe_mkdir(SCREEN_DIR)
