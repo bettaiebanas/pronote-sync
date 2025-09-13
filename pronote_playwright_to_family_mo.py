@@ -13,7 +13,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# ===================== Variables d'env (inchangées) =====================
+# ===================== Variables d'env (noms conservés) =====================
 ENT_URL       = os.getenv("ENT_URL", "https://ent77.seine-et-marne.fr/welcome")
 PRONOTE_URL   = os.getenv("PRONOTE_URL", "")
 ENT_USER      = os.getenv("PRONOTE_USER", "")
@@ -26,17 +26,17 @@ HEADFUL       = os.getenv("HEADFUL", "0") == "1"
 
 TIMETABLE_PRE_SELECTOR = os.getenv("TIMETABLE_PRE_SELECTOR", "").strip()
 TIMETABLE_SELECTOR     = os.getenv("TIMETABLE_SELECTOR", "").strip()
-TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()  # ex: 'parent.html'
+TIMETABLE_FRAME        = os.getenv("TIMETABLE_FRAME", "").strip()
 WEEK_TAB_TEMPLATE      = os.getenv("WEEK_TAB_TEMPLATE", "#GInterface\\.Instances\\[2\\]\\.Instances\\[0\\]_j_{n}").strip()
 
 FETCH_WEEKS_FROM       = int(os.getenv("FETCH_WEEKS_FROM", "1"))
-WEEKS_TO_FETCH         = int(os.getenv("WEEKS_TO_FETCH", "4"))
+WEEKS_TO_FETCH         = int(os.getenv("WEEKS_TO_FETCH", "44"))  # défaut: 1→44
 CLICK_TOUT_VOIR        = os.getenv("CLICK_TOUT_VOIR", "1") == "1"
 WAIT_AFTER_NAV_MS      = int(os.getenv("WAIT_AFTER_NAV_MS", "1000"))
 
-# Bornes anti-hang
-MAX_TILES_PER_WEEK     = int(os.getenv("MAX_TILES_PER_WEEK", "120"))
-MAX_CLICK_PER_SELECTOR = int(os.getenv("MAX_CLICK_PER_SELECTOR", "120"))
+# gardes-fous
+MAX_TILES_PER_WEEK     = int(os.getenv("MAX_TILES_PER_WEEK", "140"))
+MAX_CLICK_PER_SELECTOR = int(os.getenv("MAX_CLICK_PER_SELECTOR", "140"))
 WEEK_HARD_TIMEOUT_MS   = int(os.getenv("WEEK_HARD_TIMEOUT_MS", "120000"))
 PANEL_WAIT_MS          = int(os.getenv("PANEL_WAIT_MS", "350"))
 PANEL_RETRIES          = int(os.getenv("PANEL_RETRIES", "8"))
@@ -45,9 +45,8 @@ CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
 SCOPES           = ["https://www.googleapis.com/auth/calendar"]
 TIMEZONE         = "Europe/Paris"
-
-TIMEOUT_MS  = 120_000
-SCREEN_DIR  = "screenshots"
+TIMEOUT_MS       = 120_000
+SCREEN_DIR       = "screenshots"
 
 # ===================== Console UTF-8 =====================
 try:
@@ -79,9 +78,10 @@ def _safe_write(path: str, data: str, enc: str = "utf-8") -> None:
     except Exception as e:
         log(f"[DEBUG] write fail {path}: {e}")
 
-# ===================== GCAL =====================
+# ===================== Google Calendar =====================
 def get_gcal_service():
-    if not CALENDAR_ID: raise SystemExit("CALENDAR_ID manquant.")
+    if not CALENDAR_ID:
+        raise SystemExit("CALENDAR_ID manquant.")
     creds = None
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
@@ -102,24 +102,69 @@ def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode()
     return re.sub(r"\s+"," ",s).strip().lower()
 
-def make_dedupe_key(start: datetime, end: datetime, title: str, location: str) -> str:
-    key = f"{start.isoformat()}|{end.isoformat()}|{_norm(title)}|{_norm(location)}"
+def dedupe_base(summary_raw: str, room: str) -> str:
+    # enlève les préfixes [XX] et les mentions de statut pour dédoublonner de façon stable
+    s = re.sub(r'^\s*\[[^\]]+\]\s*', '', summary_raw or '')
+    s = re.sub(r'\s*\((prof\.?\s*absent|cours\s+annul[eé]|changement\s+de\s+salle|cours\s+modifi[eé])\)\s*$', '', s, flags=re.I)
+    return f"{_norm(s)}|{_norm(room or '')}"
+
+def make_dedupe_key(start: datetime, end: datetime, summary_raw: str, room: str) -> str:
+    base = dedupe_base(summary_raw, room)
+    key = f"{start.isoformat()}|{end.isoformat()}|{base}"
     return hashlib.sha1(key.encode()).hexdigest()
 
-def upsert_event_by_dedupe(svc, cal_id: str, body: Dict[str, Any], dedupe_key: str) -> Tuple[str, Dict[str, Any]]:
+def parse_iso(dt_str: str) -> Optional[datetime]:
+    if not dt_str: return None
+    dt_str = dt_str.replace('Z', '+00:00')
+    try: return datetime.fromisoformat(dt_str)
+    except Exception: return None
+
+def upsert_event_by_dedupe(svc, cal_id: str, body: Dict[str, Any], summary_raw: str, room: str) -> Tuple[str, Dict[str, Any]]:
+    """Upsert robuste, indépendant du TITLE_PREFIX + fallback de recherche locale."""
+    s_dt = datetime.fromisoformat(body["start"]["dateTime"])
+    e_dt = datetime.fromisoformat(body["end"]["dateTime"])
+    dedupe_key = make_dedupe_key(s_dt, e_dt, summary_raw, room)
+
+    # 1) recherche par extendedProperties.private.dedupe
     try:
         existing = svc.events().list(
             calendarId=cal_id,
             privateExtendedProperty=f"dedupe={dedupe_key}",
             timeMin=body["start"]["dateTime"],
-            timeMax=(datetime.fromisoformat(body["end"]["dateTime"])+timedelta(minutes=1)).isoformat(),
-            maxResults=2,
-            singleEvents=True,
-            showDeleted=False
+            timeMax=(e_dt + timedelta(minutes=1)).isoformat(),
+            maxResults=2, singleEvents=True, showDeleted=False
         ).execute()
         items = existing.get("items", [])
-    except HttpError as e:
+    except HttpError:
         items = []
+
+    if not items:
+        # 2) fallback: chercher dans le même créneau des events créés par nous et comparer titre/salle normalisés
+        try:
+            window = svc.events().list(
+                calendarId=cal_id,
+                timeMin=body["start"]["dateTime"],
+                timeMax=(e_dt + timedelta(minutes=1)).isoformat(),
+                singleEvents=True, showDeleted=False, maxResults=50,
+                privateExtendedProperty="source=pronote_playwright"
+            ).execute()
+            cand = None
+            for ev in window.get("items", []):
+                s0 = parse_iso(ev.get("start",{}).get("dateTime"))
+                e0 = parse_iso(ev.get("end",{}).get("dateTime"))
+                if not s0 or not e0: continue
+                if s0.isoformat() != body["start"]["dateTime"] or e0.isoformat() != body["end"]["dateTime"]:
+                    continue
+                same_room  = _norm(ev.get("location","")) == _norm(room or "")
+                same_title = dedupe_base(ev.get("summary",""), ev.get("location","")) == dedupe_base(summary_raw, room)
+                if same_room and same_title:
+                    cand = ev; break
+            if cand:
+                body.setdefault("extendedProperties", {}).setdefault("private", {})["dedupe"] = dedupe_key
+                ev = svc.events().patch(calendarId=cal_id, eventId=cand["id"], body=body, sendUpdates="none").execute()
+                return "updated", ev
+        except HttpError:
+            pass
 
     if items:
         ev_id = items[0]["id"]
@@ -129,7 +174,7 @@ def upsert_event_by_dedupe(svc, cal_id: str, body: Dict[str, Any], dedupe_key: s
         ev = svc.events().insert(calendarId=cal_id, body=body, sendUpdates="none").execute()
         return "created", ev
 
-# ===================== Parsing =====================
+# ===================== Parsing PRONOTE =====================
 H_PATTERNS = [
     re.compile(r'(?P<h>\d{1,2})\s*[hH:]\s*(?P<m>\d{2})'),
     re.compile(r'(?P<h>\d{1,2})\s*(?:heures?|hrs?)\s*(?P<m>\d{2})', re.IGNORECASE)
@@ -206,7 +251,7 @@ def first_locator_any(page: Page, selectors: List[str]):
             for sel in selectors:
                 loc = ctx.locator(sel)
                 if loc.count() > 0: return loc.first
-        except Exception: 
+        except Exception:
             continue
     return None
 
@@ -239,7 +284,6 @@ def _frame_has_timetable_js() -> str:
     """
 
 def _frame_has_dom_grid_js() -> str:
-    # vrai DOM ciblé : présence des blocs id_*_coursInt_* ou id_*_cont*
     return r"""
       () => {
         const q1 = document.querySelectorAll('[id^="id_"][id*="_coursInt_"]').length;
@@ -256,26 +300,25 @@ def find_timetable_ctx(page: Page, timeout_ms: int = TIMEOUT_MS) -> Union[Page, 
             for fr in page.frames:
                 try:
                     if TIMETABLE_FRAME in (fr.url or "") or TIMETABLE_FRAME in (fr.name or ""):
-                        if fr.evaluate(_frame_has_timetable_js()): 
+                        if fr.evaluate(_frame_has_timetable_js()):
                             return fr
-                except Exception: 
+                except Exception:
                     continue
         for fr in page.frames:
             try:
                 if fr.evaluate(_frame_has_timetable_js()):
                     return fr
-            except Exception: 
+            except Exception:
                 continue
         try:
             if page.evaluate(_frame_has_timetable_js()):
                 return page
-        except Exception: 
+        except Exception:
             pass
         page.wait_for_timeout(250)
     raise TimeoutError("Timetable context not found")
 
 def find_dom_grid_ctx(page: Page, prefer: Optional[Union[Page, Frame]] = None, timeout_ms: int = 5000) -> Optional[Union[Page, Frame]]:
-    # essaie d'abord 'prefer', ensuite tous les frames, puis la page
     end = time.time() + timeout_ms/1000.0
     while time.time() < end:
         cand = []
@@ -290,9 +333,6 @@ def find_dom_grid_ctx(page: Page, prefer: Optional[Union[Page, Frame]] = None, t
                 continue
         page.wait_for_timeout(250)
     return None
-
-def wait_timetable_any(page: Page, timeout_ms: int = TIMEOUT_MS) -> Union[Page, Frame]:
-    return find_timetable_ctx(page, timeout_ms)
 
 def click_css_any(page_or_frame: Union[Page, Frame], css: str, screenshot_tag: str = "") -> bool:
     if not css: return False
@@ -407,7 +447,6 @@ def goto_timetable(pronote_page: Page) -> Union[Page, Frame]:
                 ctx = find_timetable_ctx(pronote_page, timeout_ms=30_000)
             except TimeoutError:
                 ctx = pronote_page
-            # IMPORTANT: bascule vers le frame qui possède la grille
             grid = find_dom_grid_ctx(pronote_page, prefer=ctx, timeout_ms=5000) or ctx
             _safe_shot(grid, "08-timetable-custom-selector")
             return grid
@@ -427,14 +466,31 @@ def ensure_all_visible(ctx: Union[Page, Frame]) -> None:
         click_css_any(ctx, '*:has-text("Tout afficher")', "tout-afficher")
         (ctx.page if isinstance(ctx, Frame) else ctx).wait_for_timeout(250)
 
-def goto_week_by_index(pronote_page: Page, current_ctx: Union[Page, Frame], n: int) -> Union[Page, Frame]:
-    """Clique l'onglet semaine et retourne le **nouveau** contexte DOM où se trouve la grille (peut changer de frame)."""
+def _exists_css(ctx: Union[Page, Frame], css: str) -> bool:
+    try:
+        return bool(ctx.evaluate("(s)=>!!document.querySelector(s)", css))
+    except Exception:
+        return False
+
+def goto_week_by_index(pronote_page: Page, current_ctx: Union[Page, Frame], n: int) -> Optional[Union[Page, Frame]]:
+    """Clique l'onglet semaine n si présent, et renvoie le contexte de la grille. Si absent, retourne None (skip propre)."""
     if not WEEK_TAB_TEMPLATE:
-        return current_ctx
+        return None
     css = WEEK_TAB_TEMPLATE.format(n=n)
-    click_css_any(current_ctx, css, f"week-{n}")
-    # après le clic, on réacquiert la grille par présence des sélecteurs
-    grid = find_dom_grid_ctx(pronote_page, prefer=current_ctx, timeout_ms=5000) or current_ctx
+
+    # Cherche où se trouve le tab (frame courant sinon scanne tout)
+    ctx_for_click: Optional[Union[Page, Frame]] = current_ctx if _exists_css(current_ctx, css) else None
+    if not ctx_for_click:
+        for fr in list(pronote_page.frames) + [pronote_page]:
+            if _exists_css(fr, css):
+                ctx_for_click = fr
+                break
+    if not ctx_for_click:
+        return None  # onglet absent → on passe
+
+    click_css_any(ctx_for_click, css, f"week-{n}")
+    # Réacquiert le frame qui contient la grille réelle
+    grid = find_dom_grid_ctx(pronote_page, prefer=ctx_for_click, timeout_ms=5000) or ctx_for_click
     return grid
 
 # ===================== Extraction =====================
@@ -468,6 +524,19 @@ def _click_by_id(ctx: Union[Page, Frame], el_id: str) -> bool:
       return true;
     }""", el_id)
 
+def _get_tile_status(ctx: Union[Page, Frame], el_id: str) -> str:
+    try:
+        return ctx.evaluate(r"""(id) => {
+          const el = document.getElementById(id);
+          if (!el) return '';
+          const t = (el.innerText || '').replace(/\s+/g,' ').trim().toLowerCase();
+          const labels = ['prof. absent','prof absent','cours annulé','cours annule','changement de salle','cours modifié','cours modifie'];
+          for (const L of labels) if (t.includes(L)) return L;
+          return '';
+        }""", el_id) or ""
+    except Exception:
+        return ""
+
 def _read_visible_panel(ctx: Union[Page, Frame]) -> Optional[Dict[str, Any]]:
     for _ in range(PANEL_RETRIES):
         panel = ctx.evaluate(r"""() => {
@@ -482,48 +551,21 @@ def _read_visible_panel(ctx: Union[Page, Frame]) -> Optional[Dict[str, Any]]:
           };
           return header ? { header, matiere: pick('matière') || pick('matiere'), salle: pick('salles') || pick('salle') } : null;
         }""")
-        if panel: 
+        if panel:
             return panel
         time.sleep(PANEL_WAIT_MS/1000.0)
     return None
 
-def _collect_pairs_by_proximity(ctx: Union[Page, Frame]) -> List[Dict[str, str]]:
-    return ctx.evaluate(r"""() => {
-      const cours = Array.from(document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')).map(e=>({id:e.id, r:e.getBoundingClientRect()}));
-      const conts = Array.from(document.querySelectorAll('[id^="id_"][id*="_cont"]')).map(e=>({id:e.id, r:e.getBoundingClientRect(), text:(e.innerText||'').replace(/\s+/g,' ').trim()}));
-      const byBase = (s) => (s.match(/^id_(\d+)_/)||[])[1]||'';
-      const groupCont = {};
-      for (const c of conts) {
-        const b = byBase(c.id);
-        (groupCont[b] = groupCont[b] || []).push(c);
-      }
-      const out = [];
-      for (const cu of cours) {
-        const b = byBase(cu.id);
-        const list = (groupCont[b]||[]);
-        if (!list.length) { out.push({id:cu.id, aria:'', cont:''}); continue; }
-        let best = list[0], bestd = 1e12;
-        for (const x of list) {
-          const d = Math.abs((x.r.top + x.r.bottom)/2 - (cu.r.top + cu.r.bottom)/2);
-          if (d < bestd) { best=x; bestd=d; }
-        }
-        out.push({id:cu.id, aria:(document.getElementById(cu.id)?.getAttribute('aria-label')||''), cont: best.text});
-      }
-      return out;
-    }""")
-
-def _read_week_header(ctx: Union[Page, Frame]) -> str:
+def extract_week_info(ctx: Union[Page, Frame]) -> Dict[str, Any]:
+    header_text = ""
     try:
-        return ctx.evaluate(r"""() => {
+        header_text = ctx.evaluate(r"""() => {
           const txt = (document.body.innerText || '').replace(/\s+/g,' ');
           const m = txt.match(/du\s+\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\s+au\s+\d{1,2}\/\d{1,2}(?:\/\d{2,4})?/i);
           return m ? m[0] : '';
         }""")
     except Exception:
-        return ""
-
-def extract_week_info(ctx: Union[Page, Frame]) -> Dict[str, Any]:
-    header_text = _read_week_header(ctx)
+        pass
 
     monday: Optional[datetime] = None
     try:
@@ -538,35 +580,24 @@ def extract_week_info(ctx: Union[Page, Frame]) -> Dict[str, Any]:
     tiles: List[Dict[str, Any]] = []
     year = (monday.year if monday else datetime.now().year)
 
-    counts = {}
-    for sel in ['[id^="id_"][id*="_coursInt_"] table','[id^="id_"][id*="_coursInt_"]','[id^="id_"][id*="_cont"]']:
-        try:
-            c = ctx.evaluate("(s)=>document.querySelectorAll(s).length", sel)
-        except Exception:
-            c = 0
-        counts[sel] = int(c or 0)
-    _safe_write(f"{SCREEN_DIR}/edp_selector_counts.json", json.dumps(counts, ensure_ascii=False, indent=2))
-
-    click_log = []
     ids = _list_course_ids(ctx)
     lim = min(len(ids), MAX_TILES_PER_WEEK)
     for i in range(lim):
         el_id = ids[i]
+        status = _get_tile_status(ctx, el_id)
         ok = _click_by_id(ctx, el_id)
         if not ok:
-            click_log.append({"id": el_id, "clicked": False})
             continue
         panel = _read_visible_panel(ctx)
         if not panel:
-            click_log.append({"id": el_id, "clicked": True, "panel": None})
             continue
         parsed = parse_panel(panel, year)
-        click_log.append({"id": el_id, "clicked": True, "panel_header": panel.get("header",""), "parsed_ok": bool(parsed)})
         if not parsed:
             continue
         tiles.append({
             "label": f"{parsed['summary']} — {panel.get('header','')}",
             "summary": parsed["summary"],
+            "status": status,
             "room": parsed["room"],
             "start_dt": parsed["start_dt"],
             "end_dt": parsed["end_dt"]
@@ -576,93 +607,6 @@ def extract_week_info(ctx: Union[Page, Frame]) -> Dict[str, Any]:
         if len(tiles) >= MAX_TILES_PER_WEEK:
             break
 
-    _safe_write(f"{SCREEN_DIR}/edp_click_log.json", json.dumps(click_log, ensure_ascii=False, indent=2))
-
-    if not tiles:
-        panels = ctx.evaluate(r"""() => {
-          const list = [];
-          const panels = Array.from(document.querySelectorAll('.ConteneurCours'));
-          for (const p of panels) {
-            const header = (p.querySelector('.EnteteCoursLibelle')?.innerText||'').replace(/\s+/g,' ').trim();
-            if (!header) continue;
-            const groups = Array.from(p.querySelectorAll('[role="group"]'));
-            const pick = (name) => {
-              const g = groups.find(x => (x.getAttribute('aria-label')||'').toLowerCase().includes(name));
-              return g ? (g.innerText||'').replace(/\s+/g,' ').trim() : '';
-            };
-            list.push({ header, matiere: pick('matière') || pick('matiere'), salle: pick('salles') || pick('salle') });
-          }
-          return list;
-        }""")
-        for panel in (panels or []):
-            parsed = parse_panel(panel, year)
-            if not parsed: 
-                continue
-            tiles.append({
-                "label": f"{parsed['summary']} — {panel.get('header','')}",
-                "summary": parsed["summary"],
-                "room": parsed["room"],
-                "start_dt": parsed["start_dt"],
-                "end_dt": parsed["end_dt"]
-            })
-            if len(tiles) >= MAX_TILES_PER_WEEK:
-                break
-
-    if not tiles:
-        pairs = _collect_pairs_by_proximity(ctx)
-        _safe_write(f"{SCREEN_DIR}/edp_pairs_preview.json", json.dumps(pairs[:20], ensure_ascii=False, indent=2))
-        for t in pairs:
-            aria = t.get("aria","")
-            cont = t.get("cont","")
-            times = parse_times(aria)
-            if not (times["start"] or times["end"]): continue
-            dt_date = parse_date_from_text(aria, fallback_year=year)
-            if not dt_date and monday:
-                text_l = (aria or '').lower()
-                jours = ['lundi','mardi','mercredi','jeudi','vendredi','samedi','dimanche']
-                found = next((i for i,n in enumerate(jours) if n in text_l), None)
-                if found is not None: dt_date = monday + timedelta(days=found)
-            if not dt_date: continue
-
-            start_hm = times["start"]; end_hm = times["end"]
-            if start_hm and end_hm:
-                start_dt = to_dt(dt_date, start_hm); end_dt = to_dt(dt_date, end_hm)
-            elif start_hm and times["duration"]:
-                dh, dm = times["duration"]; start_dt = to_dt(dt_date, start_hm); end_dt = start_dt + timedelta(hours=dh, minutes=dm)
-            else:
-                continue
-            summary = (re.sub(r'\s+',' ', cont).strip() or "Cours")
-            room = ""
-            m = re.search(r'(?:Salle[s]?\s+)(.+)$', cont, re.IGNORECASE)
-            if m: room = m.group(1).strip()
-            tiles.append({
-                "label": f"{summary} — {aria}",
-                "summary": summary,
-                "room": room,
-                "start_dt": start_dt,
-                "end_dt": end_dt
-            })
-            if len(tiles) >= MAX_TILES_PER_WEEK:
-                break
-
-    if not tiles:
-        try: html_full = ctx.evaluate("() => document.documentElement.outerHTML")
-        except Exception: html_full = ""
-        _safe_write(f"{SCREEN_DIR}/edp_full_dom.html", html_full)
-        ids_dump = ctx.evaluate(r"""() => ({
-          cours: Array.from(document.querySelectorAll('[id^="id_"][id*="_coursInt_"]')).map(e=>e.id),
-          conts: Array.from(document.querySelectorAll('[id^="id_"][id*="_cont"]')).map(e=>e.id),
-          entetes: Array.from(document.querySelectorAll('.EnteteCoursLibelle')).map(e=>e.innerText.trim()).slice(0,50)
-        })""")
-        _safe_write(f"{SCREEN_DIR}/edp_candidates.json", json.dumps(ids_dump, ensure_ascii=False, indent=2))
-
-    _safe_write(f"{SCREEN_DIR}/edp_debug_summary.json", json.dumps({
-        "header": header_text, 
-        "monday": monday.isoformat() if monday else None,
-        "click_ids": ids[:lim] if ids else [],
-        "total_tiles": len(tiles)
-    }, ensure_ascii=False, indent=2))
-
     return {"monday": monday, "tiles": tiles, "header": header_text}
 
 # ===================== Main =====================
@@ -671,24 +615,15 @@ def run() -> None:
         raise SystemExit("PRONOTE_USER / PRONOTE_PASS manquants.")
 
     svc = get_gcal_service()
-
-    # --- Qui suis-je, et quel calendrier ?
+    # log d'info compte/agenda pour éviter les confusions
     try:
         me_primary = svc.calendars().get(calendarId="primary").execute()
+        cal_meta   = svc.calendars().get(calendarId=CALENDAR_ID).execute()
+        log(f"[GCAL] Utilisation agenda '{cal_meta.get('summary','?')}' (id={CALENDAR_ID}) en tant que {me_primary.get('id','?')}")
     except Exception:
-        me_primary = {}
-    try:
-        cal_meta = svc.calendars().get(calendarId=CALENDAR_ID).execute()
-    except Exception as e:
-        cal_meta = {"error": str(e)}
-
-    _safe_write(f"{SCREEN_DIR}/gcal_whoami.json", json.dumps({
-        "primary": me_primary, "target_calendar": cal_meta
-    }, ensure_ascii=False, indent=2))
-    log(f"[GCAL] Using calendar '{cal_meta.get('summary','?')}' (id={CALENDAR_ID}) as {me_primary.get('id','?')}")
+        pass
 
     created = updated = 0
-    created_events_dump: List[Dict[str, Any]] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not HEADFUL, args=["--disable-dev-shm-usage"])
@@ -701,16 +636,16 @@ def run() -> None:
 
         start_idx = max(1, FETCH_WEEKS_FROM)
         end_idx   = start_idx + max(1, WEEKS_TO_FETCH) - 1
-
-        overall_min_dt: Optional[datetime] = None
-        overall_max_dt: Optional[datetime] = None
+        end_idx   = min(end_idx, 60)  # garde-fou
 
         for week_idx in range(start_idx, end_idx + 1):
             log(f"-> Selection Semaine index={week_idx} via css '{WEEK_TAB_TEMPLATE.format(n=week_idx)}'")
-            # >>> NOUVEAU : on récupère le **nouveau** ctx basé sur la grille DOM
-            ctx = goto_week_by_index(pronote, ctx, week_idx)
-            accept_cookies_any(pronote); ensure_all_visible(ctx)
-            _safe_shot(ctx, f"08-week-{week_idx}-after-select")
+            new_ctx = goto_week_by_index(pronote, ctx, week_idx)
+            if not new_ctx:
+                log(f"[WEEK] Onglet {week_idx} introuvable — on passe.")
+                continue
+            ctx = new_ctx
+            ensure_all_visible(ctx)
 
             info  = extract_week_info(ctx)
             tiles = info["tiles"] or []
@@ -721,68 +656,39 @@ def run() -> None:
                 start_dt = t["start_dt"]; end_dt = t["end_dt"]
                 summary  = t.get("summary") or "Cours"
                 room     = t.get("room","")
+                status   = (t.get("status") or "").strip()
+
+                # Filtre anti-inondation (historique très ancien / trop lointain)
                 now = datetime.now()
-                if end_dt < (now - timedelta(days=60)) or start_dt > (now + timedelta(days=180)):
+                if end_dt < (now - timedelta(days=120)) or start_dt > (now + timedelta(days=240)):
                     continue
 
-                title    = f"{TITLE_PREFIX}{summary}"
-                dedupe   = make_dedupe_key(start_dt, end_dt, title, room)
+                status_tag = ""
+                if status:
+                    if "prof" in status: status_tag = " (Prof. absent)"
+                    elif "annul" in status: status_tag = " (Cours annulé)"
+                    elif "changement de salle" in status: status_tag = " (Changement de salle)"
+                    elif "modifi" in status: status_tag = " (Cours modifié)"
+
+                title = f"{TITLE_PREFIX}{summary}{status_tag}"
                 body = {
                     "summary": title,
                     "location": room,
                     "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
                     "end":   {"dateTime": end_dt.isoformat(),   "timeZone": TIMEZONE},
                     "colorId": COLOR_ID,
-                    "extendedProperties": {"private": {"source": "pronote_playwright", "dedupe": dedupe}}
+                    "extendedProperties": {"private": {"source": "pronote_playwright"}}
                 }
                 try:
-                    action, ev = upsert_event_by_dedupe(svc, CALENDAR_ID, body, dedupe)
+                    action, _ = upsert_event_by_dedupe(svc, CALENDAR_ID, body, summary, room)
                     if action == "created": created += 1
                     else: updated += 1
-                    created_events_dump.append({
-                        "action": action,
-                        "summary": ev.get("summary"),
-                        "start": ev.get("start"),
-                        "end": ev.get("end"),
-                        "htmlLink": ev.get("htmlLink"),
-                        "id": ev.get("id"),
-                    })
                 except HttpError as e:
                     log(f"[GCAL] {e}")
 
-                overall_min_dt = min(overall_min_dt or start_dt, start_dt)
-                overall_max_dt = max(overall_max_dt or end_dt,   end_dt)
-
-            if week_idx < end_idx:
-                # après navigation suivante, le frame peut changer ⇒ on le réacquiert au tour suivant via goto_week_by_index
-                clicked = click_css_any(ctx, 'button[title*="suivante"]') or \
-                          click_css_any(ctx, 'button[aria-label*="suivante"]') or \
-                          click_css_any(ctx, 'a:has-text("Semaine suivante")')
-                if clicked:
-                    _safe_shot(ctx, "09-next-week")
-
         browser.close()
 
-    _safe_write(f"{SCREEN_DIR}/gcal_created_events.json", json.dumps(created_events_dump, ensure_ascii=False, indent=2))
-
-    verified_count = 0
-    if overall_min_dt and overall_max_dt:
-        try:
-            ver = svc.events().list(
-                calendarId=CALENDAR_ID,
-                timeMin=(overall_min_dt - timedelta(days=1)).isoformat(),
-                timeMax=(overall_max_dt + timedelta(days=1)).isoformat(),
-                singleEvents=True,
-                showDeleted=False,
-                maxResults=2500,
-                privateExtendedProperty="source=pronote_playwright"
-            ).execute()
-            verified_count = len(ver.get("items", []))
-            _safe_write(f"{SCREEN_DIR}/gcal_search_after_run.json", json.dumps(ver, ensure_ascii=False, indent=2))
-        except Exception as e:
-            log(f"[GCAL VERIFY] {e}")
-
-    log(f"Termine. crees={created}, maj={updated}, verif_trouves={verified_count}")
+    log(f"Termine. crees={created}, maj={updated}")
 
 if __name__ == "__main__":
     try:
