@@ -102,8 +102,27 @@ def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode()
     return re.sub(r"\s+"," ",s).strip().lower()
 
+# --- NEW: cœur de titre sans préfixe ni statut pour un dédoublonnage stable
+_STATUS_CANON = {
+    "prof. absent": "Prof. absent",
+    "prof absent": "Prof. absent",
+    "cours annulé": "Cours annulé",
+    "cours annule": "Cours annulé",
+    "changement de salle": "Changement de salle",
+    "cours modifié": "Cours modifié",
+    "cours modifie": "Cours modifié",
+}
+_STATUS_RE = re.compile(r'\((?:prof\.?\s*absent|cours\s+annul[eé]|changement\s+de\s+salle|cours\s+modifi[eé])\)\s*$', re.I)
+
+def _title_core(title: str) -> str:
+    t = title or ""
+    t = re.sub(r'^\s*\[[^\]]+\]\s*', '', t)          # retire [XX]
+    t = _STATUS_RE.sub('', t)                        # retire (statut)
+    return t.strip()
+
 def make_dedupe_key(start: datetime, end: datetime, title: str, location: str) -> str:
-    key = f"{start.isoformat()}|{end.isoformat()}|{_norm(title)}|{_norm(location)}"
+    # ⚠️ signature conservée ; la clé est calculée sur le "cœur" du titre
+    key = f"{start.isoformat()}|{end.isoformat()}|{_norm(_title_core(title))}|{_norm(location)}"
     return hashlib.sha1(key.encode()).hexdigest()
 
 def upsert_event_by_dedupe(svc, cal_id: str, body: Dict[str, Any], dedupe_key: str) -> Tuple[str, Dict[str, Any]]:
@@ -569,7 +588,9 @@ def extract_week_info(ctx: Union[Page, Frame]) -> Dict[str, Any]:
             "summary": parsed["summary"],
             "room": parsed["room"],
             "start_dt": parsed["start_dt"],
-            "end_dt": parsed["end_dt"]
+            "end_dt": parsed["end_dt"],
+            # --- NEW: on conserve aussi le header pour détecter les statuts côté run()
+            "panel_header": panel.get("header",""),
         })
         try: ctx.evaluate("()=>document.body.click()")
         except Exception: pass
@@ -603,7 +624,8 @@ def extract_week_info(ctx: Union[Page, Frame]) -> Dict[str, Any]:
                 "summary": parsed["summary"],
                 "room": parsed["room"],
                 "start_dt": parsed["start_dt"],
-                "end_dt": parsed["end_dt"]
+                "end_dt": parsed["end_dt"],
+                "panel_header": panel.get("header",""),
             })
             if len(tiles) >= MAX_TILES_PER_WEEK:
                 break
@@ -640,7 +662,8 @@ def extract_week_info(ctx: Union[Page, Frame]) -> Dict[str, Any]:
                 "summary": summary,
                 "room": room,
                 "start_dt": start_dt,
-                "end_dt": end_dt
+                "end_dt": end_dt,
+                "panel_header": aria,
             })
             if len(tiles) >= MAX_TILES_PER_WEEK:
                 break
@@ -707,7 +730,6 @@ def run() -> None:
 
         for week_idx in range(start_idx, end_idx + 1):
             log(f"-> Selection Semaine index={week_idx} via css '{WEEK_TAB_TEMPLATE.format(n=week_idx)}'")
-            # >>> NOUVEAU : on récupère le **nouveau** ctx basé sur la grille DOM
             ctx = goto_week_by_index(pronote, ctx, week_idx)
             accept_cookies_any(pronote); ensure_all_visible(ctx)
             _safe_shot(ctx, f"08-week-{week_idx}-after-select")
@@ -725,7 +747,16 @@ def run() -> None:
                 if end_dt < (now - timedelta(days=60)) or start_dt > (now + timedelta(days=180)):
                     continue
 
-                title    = f"{TITLE_PREFIX}{summary}"
+                # --- NEW: statut depuis panel_header/label
+                ph = (t.get("panel_header","") or "") + " " + (t.get("label","") or "")
+                plo = ph.lower()
+                status_tag = ""
+                for k, canon in _STATUS_CANON.items():
+                    if k in plo:
+                        status_tag = f" ({canon})"
+                        break
+
+                title    = f"{TITLE_PREFIX}{summary}{status_tag}"
                 dedupe   = make_dedupe_key(start_dt, end_dt, title, room)
                 body = {
                     "summary": title,
@@ -754,7 +785,6 @@ def run() -> None:
                 overall_max_dt = max(overall_max_dt or end_dt,   end_dt)
 
             if week_idx < end_idx:
-                # après navigation suivante, le frame peut changer ⇒ on le réacquiert au tour suivant via goto_week_by_index
                 clicked = click_css_any(ctx, 'button[title*="suivante"]') or \
                           click_css_any(ctx, 'button[aria-label*="suivante"]') or \
                           click_css_any(ctx, 'a:has-text("Semaine suivante")')
