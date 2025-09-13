@@ -310,6 +310,22 @@ def find_dom_grid_ctx(page: Page, prefer: Optional[Union[Page, Frame]] = None, t
         page.wait_for_timeout(250)
     return None
 
+
+def _wait_for_grid(pronote_page: Page, prefer: Union[Page, Frame], timeout_ms: int = 20000) -> Union[Page, Frame]:
+    """Boucle jusqu'à trouver un contexte (frame/page) qui contient réellement la grille (id_*_coursInt_* / _cont / EnteteCoursLibelle)."""
+    deadline = time.time() + timeout_ms/1000.0
+    last_ctx = prefer
+    while time.time() < deadline:
+        ctx = find_dom_grid_ctx(pronote_page, prefer=last_ctx, timeout_ms=1500) or last_ctx
+        try:
+            cnt = ctx.evaluate(r'() => document.querySelectorAll("[id^=\\"id_\\"][id*=\\"_coursInt_\\"]').length + document.querySelectorAll("[id^=\\"id_\\"][id*=\\"_cont\\"]').length + document.querySelectorAll(".EnteteCoursLibelle").length')
+            if int(cnt or 0) > 0:
+                return ctx
+        except Exception:
+            pass
+        (pronote_page.page if isinstance(pronote_page, Frame) else pronote_page).wait_for_timeout(250)
+        last_ctx = ctx
+    return last_ctx
 def wait_timetable_any(page: Page, timeout_ms: int = TIMEOUT_MS) -> Union[Page, Frame]:
     return find_timetable_ctx(page, timeout_ms)
 
@@ -446,6 +462,7 @@ def ensure_all_visible(ctx: Union[Page, Frame]) -> None:
         click_css_any(ctx, '*:has-text("Tout afficher")', "tout-afficher")
         (ctx.page if isinstance(ctx, Frame) else ctx).wait_for_timeout(250)
 
+
 def goto_week_by_index(pronote_page: Page, current_ctx: Union[Page, Frame], n: int) -> Union[Page, Frame]:
     """Clique l'onglet semaine et retourne le **nouveau** contexte DOM où se trouve la grille (peut changer de frame)."""
     if not WEEK_TAB_TEMPLATE:
@@ -454,7 +471,10 @@ def goto_week_by_index(pronote_page: Page, current_ctx: Union[Page, Frame], n: i
     click_css_any(current_ctx, css, f"week-{n}")
     # après le clic, on réacquiert la grille par présence des sélecteurs
     grid = find_dom_grid_ctx(pronote_page, prefer=current_ctx, timeout_ms=5000) or current_ctx
+    # --- NOUVEAU : attends de façon robuste que la grille soit présente dans le bon frame
+    grid = _wait_for_grid(pronote_page, grid, timeout_ms=WEEK_HARD_TIMEOUT_MS)
     return grid
+
 
 # ===================== Extraction =====================
 def _list_course_ids(ctx: Union[Page, Frame]) -> List[str]:
