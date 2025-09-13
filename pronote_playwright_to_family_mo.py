@@ -107,7 +107,6 @@ def make_dedupe_key(start: datetime, end: datetime, title: str, location: str) -
     return hashlib.sha1(key.encode()).hexdigest()
 
 def upsert_event_by_dedupe(svc, cal_id: str, body: Dict[str, Any], dedupe_key: str) -> Tuple[str, Dict[str, Any]]:
-    # Recherche par extendedProperties.private.dedupe
     try:
         existing = svc.events().list(
             calendarId=cal_id,
@@ -239,6 +238,17 @@ def _frame_has_timetable_js() -> str:
       }
     """
 
+def _frame_has_dom_grid_js() -> str:
+    # vrai DOM ciblé : présence des blocs id_*_coursInt_* ou id_*_cont*
+    return r"""
+      () => {
+        const q1 = document.querySelectorAll('[id^="id_"][id*="_coursInt_"]').length;
+        const q2 = document.querySelectorAll('[id^="id_"][id*="_cont"]').length;
+        const q3 = document.querySelectorAll('.EnteteCoursLibelle').length;
+        return (q1 + q2 + q3) > 0;
+      }
+    """
+
 def find_timetable_ctx(page: Page, timeout_ms: int = TIMEOUT_MS) -> Union[Page, Frame]:
     deadline = time.time() + timeout_ms/1000.0
     while time.time() < deadline:
@@ -263,6 +273,23 @@ def find_timetable_ctx(page: Page, timeout_ms: int = TIMEOUT_MS) -> Union[Page, 
             pass
         page.wait_for_timeout(250)
     raise TimeoutError("Timetable context not found")
+
+def find_dom_grid_ctx(page: Page, prefer: Optional[Union[Page, Frame]] = None, timeout_ms: int = 5000) -> Optional[Union[Page, Frame]]:
+    # essaie d'abord 'prefer', ensuite tous les frames, puis la page
+    end = time.time() + timeout_ms/1000.0
+    while time.time() < end:
+        cand = []
+        if prefer: cand.append(prefer)
+        cand.extend(list(page.frames))
+        cand.append(page)
+        for ctx in cand:
+            try:
+                if ctx.evaluate(_frame_has_dom_grid_js()):
+                    return ctx
+            except Exception:
+                continue
+        page.wait_for_timeout(250)
+    return None
 
 def wait_timetable_any(page: Page, timeout_ms: int = TIMEOUT_MS) -> Union[Page, Frame]:
     return find_timetable_ctx(page, timeout_ms)
@@ -378,33 +405,20 @@ def goto_timetable(pronote_page: Page) -> Union[Page, Frame]:
             accept_cookies_any(pronote_page)
             try:
                 ctx = find_timetable_ctx(pronote_page, timeout_ms=30_000)
-                _safe_shot(ctx, "08-timetable-custom-selector"); return ctx
             except TimeoutError:
-                _safe_shot(pronote_page, "08-timetable-custom-timeout")
+                ctx = pronote_page
+            # IMPORTANT: bascule vers le frame qui possède la grille
+            grid = find_dom_grid_ctx(pronote_page, prefer=ctx, timeout_ms=5000) or ctx
+            _safe_shot(grid, "08-timetable-custom-selector")
+            return grid
 
     try:
         ctx = find_timetable_ctx(pronote_page, timeout_ms=10_000)
-        _safe_shot(ctx, "08-timetable-already-here"); return ctx
-    except TimeoutError: pass
-
-    attempts = [["Emploi du temps","Mon emploi du temps","Emplois du temps"],["Planning","Agenda"],["Vie scolaire","Emploi du temps"]]
-    for i,pats in enumerate(attempts,1):
-        for pat in pats:
-            if click_first_any(pronote_page, [f'*:has-text("{pat}")']):
-                accept_cookies_any(pronote_page)
-                try:
-                    ctx = find_timetable_ctx(pronote_page, timeout_ms=30_000)
-                    _safe_shot(ctx, f"08-timetable-ready-{i}-{pat}"); return ctx
-                except TimeoutError:
-                    _safe_shot(pronote_page, f"08-not-ready-{i}-{pat}")
-        pronote_page.wait_for_timeout(400)
-
-    try:
-        ctx = find_timetable_ctx(pronote_page, timeout_ms=15_000)
-        _safe_shot(ctx, "08-timetable-ready-fallback"); return ctx
     except TimeoutError:
-        _safe_shot(pronote_page, "08-timetable-NOT-found")
-        raise RuntimeError("Impossible d'atteindre l'Emploi du temps.")
+        ctx = pronote_page
+    grid = find_dom_grid_ctx(pronote_page, prefer=ctx, timeout_ms=5000) or ctx
+    _safe_shot(grid, "08-timetable-already-here")
+    return grid
 
 def ensure_all_visible(ctx: Union[Page, Frame]) -> None:
     if CLICK_TOUT_VOIR:
@@ -413,14 +427,15 @@ def ensure_all_visible(ctx: Union[Page, Frame]) -> None:
         click_css_any(ctx, '*:has-text("Tout afficher")', "tout-afficher")
         (ctx.page if isinstance(ctx, Frame) else ctx).wait_for_timeout(250)
 
-def goto_week_by_index(ctx: Union[Page, Frame], n: int) -> bool:
-    if not WEEK_TAB_TEMPLATE: return False
+def goto_week_by_index(pronote_page: Page, current_ctx: Union[Page, Frame], n: int) -> Union[Page, Frame]:
+    """Clique l'onglet semaine et retourne le **nouveau** contexte DOM où se trouve la grille (peut changer de frame)."""
+    if not WEEK_TAB_TEMPLATE:
+        return current_ctx
     css = WEEK_TAB_TEMPLATE.format(n=n)
-    ok = click_css_any(ctx, css, f"week-{n}")
-    if ok:
-        try: find_timetable_ctx(ctx.page if isinstance(ctx, Frame) else ctx, timeout_ms=20_000)
-        except TimeoutError: pass
-    return ok
+    click_css_any(current_ctx, css, f"week-{n}")
+    # après le clic, on réacquiert la grille par présence des sélecteurs
+    grid = find_dom_grid_ctx(pronote_page, prefer=current_ctx, timeout_ms=5000) or current_ctx
+    return grid
 
 # ===================== Extraction =====================
 def _list_course_ids(ctx: Union[Page, Frame]) -> List[str]:
@@ -692,7 +707,8 @@ def run() -> None:
 
         for week_idx in range(start_idx, end_idx + 1):
             log(f"-> Selection Semaine index={week_idx} via css '{WEEK_TAB_TEMPLATE.format(n=week_idx)}'")
-            used_tab = goto_week_by_index(ctx, week_idx)
+            # >>> NOUVEAU : on récupère le **nouveau** ctx basé sur la grille DOM
+            ctx = goto_week_by_index(pronote, ctx, week_idx)
             accept_cookies_any(pronote); ensure_all_visible(ctx)
             _safe_shot(ctx, f"08-week-{week_idx}-after-select")
 
@@ -734,24 +750,21 @@ def run() -> None:
                 except HttpError as e:
                     log(f"[GCAL] {e}")
 
-                # bornes pour la vérif finale
                 overall_min_dt = min(overall_min_dt or start_dt, start_dt)
                 overall_max_dt = max(overall_max_dt or end_dt,   end_dt)
 
             if week_idx < end_idx:
+                # après navigation suivante, le frame peut changer ⇒ on le réacquiert au tour suivant via goto_week_by_index
                 clicked = click_css_any(ctx, 'button[title*="suivante"]') or \
                           click_css_any(ctx, 'button[aria-label*="suivante"]') or \
                           click_css_any(ctx, 'a:has-text("Semaine suivante")')
                 if clicked:
-                    find_timetable_ctx(pronote); _safe_shot(ctx, "09-next-week")
-                else:
-                    break
+                    _safe_shot(ctx, "09-next-week")
 
         browser.close()
 
     _safe_write(f"{SCREEN_DIR}/gcal_created_events.json", json.dumps(created_events_dump, ensure_ascii=False, indent=2))
 
-    # --- Vérification finale dans le calendrier ciblé
     verified_count = 0
     if overall_min_dt and overall_max_dt:
         try:
