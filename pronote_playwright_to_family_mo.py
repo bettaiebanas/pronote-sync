@@ -295,7 +295,7 @@ def parse_times(text: str) -> Dict[str, Optional[tuple[int,int]]]:
         return {"start": hours[0], "end": hours[1], "duration": None}
     dm = DURATION_RE.search(t)
     if dm and hours:
-        return {"start": hours[-1], "end": None, "duration": (int(dm.group("dh")), int(dm.group("dm")))}
+        return {"start": hours[-1], "end": None, "duration": (int(dm.group("dh")), int(dm.group("dm"))) }
     return {"start": None, "end": None, "duration": None}
 
 MONTHS_FR = {
@@ -332,7 +332,7 @@ def parse_panel(panel: Dict[str, Any], year: int) -> Optional[Dict[str, Any]]:
     start_hm = times["start"]; end_hm = times["end"]
     if start_hm and end_hm:
         start_dt = to_dt(dt_date, start_hm); end_dt = to_dt(dt_date, end_hm)
-    elif start_hm and times["duration"]):
+    elif start_hm and times["duration"]:
         dh, dm = times["duration"]; start_dt = to_dt(dt_date, start_hm); end_dt = start_dt + timedelta(hours=dh, minutes=dm)
     else:
         return None
@@ -776,7 +776,7 @@ def extract_week_info(ctx: Union[Page, Frame]) -> Dict[str, Any]:
             start_hm = times["start"]; end_hm = times["end"]
             if start_hm and end_hm:
                 start_dt = to_dt(dt_date, start_hm); end_dt = to_dt(dt_date, end_hm)
-            elif start_hm and times["duration"]):
+            elif start_hm and times["duration"]:
                 dh, dm = times["duration"]; start_dt = to_dt(dt_date, start_hm); end_dt = start_dt + timedelta(hours=dh, minutes=dm)
             else:
                 continue
@@ -951,6 +951,6 @@ if __name__ == "__main__":
         run()
     except Exception as ex:
         _safe_mkdir(SCREEN_DIR)
-        _safe_write(f"{SCREEN_DIR}/fatal_error.txt", f\"{ex}\")
+        _safe_write(f"{SCREEN_DIR}/fatal_error.txt", f"{ex}")
         log(f"[FATAL] {ex}")
         sys.exit(1)
