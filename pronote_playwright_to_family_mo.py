@@ -311,6 +311,7 @@ def find_dom_grid_ctx(page: Page, prefer: Optional[Union[Page, Frame]] = None, t
     return None
 
 
+
 def _wait_for_grid(pronote_page: Page, prefer: Union[Page, Frame], timeout_ms: int = 20000) -> Union[Page, Frame]:
     """Boucle jusqu'à trouver un contexte (frame/page) qui contient réellement la grille (id_*_coursInt_* / _cont / EnteteCoursLibelle)."""
     deadline = time.time() + timeout_ms/1000.0
@@ -318,14 +319,21 @@ def _wait_for_grid(pronote_page: Page, prefer: Union[Page, Frame], timeout_ms: i
     while time.time() < deadline:
         ctx = find_dom_grid_ctx(pronote_page, prefer=last_ctx, timeout_ms=1500) or last_ctx
         try:
-            cnt = ctx.evaluate(r'() => document.querySelectorAll("[id^=\\"id_\\"][id*=\\"_coursInt_\\"]').length + document.querySelectorAll("[id^=\\"id_\\"][id*=\\"_cont\\"]').length + document.querySelectorAll(".EnteteCoursLibelle").length')
+            cnt = ctx.evaluate("""                () => {
+                    const a = document.querySelectorAll('[id^="id_"][id*="_coursInt_"]').length;
+                    const b = document.querySelectorAll('[id^="id_"][id*="_cont"]').length;
+                    const c = document.querySelectorAll('.EnteteCoursLibelle').length;
+                    return a + b + c;
+                }
+            """)
             if int(cnt or 0) > 0:
                 return ctx
         except Exception:
             pass
-        (pronote_page.page if isinstance(pronote_page, Frame) else pronote_page).wait_for_timeout(250)
+        pronote_page.wait_for_timeout(250)
         last_ctx = ctx
     return last_ctx
+
 def wait_timetable_any(page: Page, timeout_ms: int = TIMEOUT_MS) -> Union[Page, Frame]:
     return find_timetable_ctx(page, timeout_ms)
 
